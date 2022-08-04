@@ -1,0 +1,7 @@
+apiVersion: pfe.opentlc.com/v1
+kind: ArgoCDManaged
+metadata:
+  name: {{ prod }}
+  namespace: {{ prod }}
+spec:
+  argocdNamespace: {{ argocd }}

@@ -1,0 +1,38 @@
+---
+- import_tasks: ./100_create_project_namespace.yml
+  vars:
+    ocp_project: "{{ test }}"
+    ocp_project_description: Coffee Shop for {{ ocp_user }} (Testing)
+
+- block:
+  - name: create configmap-test.yaml file
+    ansible.builtin.copy:
+      remote_src: true
+      src: "{{ workdir }}/coffee-shop-yaml/coffee-shop/configmap.yaml"
+      dest: "{{ workdir }}/coffee-shop-yaml/coffee-shop/configmap-test.yaml"
+  - name: change value in configmap-test.yaml file
+    ansible.builtin.replace:
+      path: "{{ workdir }}/coffee-shop-yaml/coffee-shop/configmap-test.yaml"
+      regexp: '-test-'
+      replace: "-dev-"
+  - name: create configmap in {{ test }}
+    ansible.builtin.shell: |-
+      oc apply -f {{ workdir }}/coffee-shop-yaml/coffee-shop/configmap-test.yaml --overwrite -n {{ test }}
+  - name: remove configmap-test.yaml file
+    ansible.builtin.file:
+      path: "{{ workdir }}/coffee-shop-yaml/coffee-shop/configmap-test.yaml"
+      state: absent
+
+- name: apply coffee-shop resources to {{ test }}
+  ansible.builtin.shell: |-
+    oc apply -f {{ workdir }}/coffee-shop-yaml/{{ item }} --overwrite -n {{ test }}
+  loop:
+    - coffee-shop-database/pvc.yaml
+    - coffee-shop-database/{{ secret_file | default('secret.yaml') }}
+    - coffee-shop-database/service.yaml
+    - coffee-shop-database/deployment.yaml
+    - barista/knative_service.yaml
+    - coffee-shop/{{ secret_file | default('secret.yaml') }}
+    - coffee-shop/service.yaml
+    - coffee-shop/deployment.yaml
+    - coffee-shop/route.yaml

@@ -1,0 +1,25 @@
+---
+- name: expose route barista
+  ansible.builtin.shell: |-
+    oc expose service barista --dry-run --output yaml -n {{ dev }} | oc apply --overwrite -n {{ dev }} -f -
+
+- name: get route barista
+  kubernetes.core.k8s_info:
+    api_version: route.openshift.io/v1
+    kind: Route
+    name: barista
+    namespace: "{{ dev }}"
+  register: barista_route
+
+- name: test route barista health check
+  ansible.builtin.uri:
+    url: http://{{ barista_route.resources[0].spec.host }}/health
+    return_content: yes
+  register: this
+  until: this.status == 200 and 'OK' in this.content
+  retries: 3
+  delay: 5
+
+- name: delete route barista
+  ansible.builtin.shell: |-
+    oc delete route barista -n {{ dev }}

@@ -1,0 +1,28 @@
+---
+- name: create gitea repository {{ repo_name }}
+  ansible.builtin.uri:
+    url: "https://gitea.{{ ocp_apps_domain }}/api/v1/user/repos"
+    method: POST
+    force_basic_auth: true
+    user: "{{ ocp_user }}"
+    password: "{{ ocp_password }}"
+    headers:
+      accept: application/json
+    body_format: json
+    body: |
+      {
+        "auto_init": false,
+        "default_branch": "master",
+        "name": "{{ repo_name }}",
+        "private": true
+      }
+    status_code: [201, 409]
+
+- name: push {{ repo_name }} to git repository
+  ansible.builtin.shell: |-
+    set -e
+    git -C {{ workdir }}/{{ repo_name }} init --initial-branch=master || git -C {{ workdir }}/{{ repo_name }} init
+    git -C {{ workdir }}/{{ repo_name }} add --all
+    git -C {{ workdir }}/{{ repo_name }} commit -m "Initial Commit" || true
+    git -C {{ workdir }}/{{ repo_name }} remote add origin {{ gitea_url }}/{{ repo_name }}.git  2> /dev/null || true
+    git -C {{ workdir }}/{{ repo_name }} push -u origin master

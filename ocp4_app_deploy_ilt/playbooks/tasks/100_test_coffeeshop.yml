@@ -1,0 +1,40 @@
+---
+- name: wait deployment coffee-shop
+  kubernetes.core.k8s_info:
+    kind: Deployment
+    name: coffee-shop
+    namespace: "{{ test }}"
+    wait: yes
+    wait_timeout: 180
+
+- name: get route coffee-shop
+  kubernetes.core.k8s_info:
+    api_version: route.openshift.io/v1
+    kind: Route
+    name: coffee-shop
+    namespace: "{{ test }}"
+  register: coffeeshop_route
+
+- name: test route coffee-shop health check
+  ansible.builtin.uri:
+    url: http://{{ coffeeshop_route.resources[0].spec.host }}/health
+    return_content: yes
+  register: this
+  until: this.status == 200 and 'UP' in this.content
+  retries: 3
+  delay: 5
+
+- debug:
+    msg:
+      - Explore the coffee-shop application in your browser.
+      - http://{{ coffeeshop_route.resources[0].spec.host }}/index.html
+
+- name: prompt coffee-shop testing
+  ansible.builtin.pause:
+    prompt: "Continue to delete project {{ test }}"
+  when: prompt | default(false) | bool
+
+- name: delete project {{ test }}
+  ansible.builtin.shell: |
+    oc delete project {{ test }}
+  ignore_errors: true

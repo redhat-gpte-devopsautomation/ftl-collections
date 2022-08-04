@@ -1,0 +1,43 @@
+---
+- debug:
+    msg: "LAB 01 ENVIRONMENT SETUP"
+
+- name: install python requirements
+  ansible.builtin.pip:
+    name:
+      - kubernetes
+  when: ansible_facts['system'] != "Linux"
+
+- name: check podman installed and running
+  ansible.builtin.shell: |-
+    podman ps
+
+- name: oc login with {{ ocp_user }}
+  ansible.builtin.shell: |-
+    oc login -u {{ ocp_user }} -p {{ ocp_password }} {{ ocp_api }} --insecure-skip-tls-verify
+
+- name: create work directory
+  ansible.builtin.file:
+    path: "{{ workdir }}"
+    state: directory
+
+- name: git clone coffee-shop-source
+  ansible.builtin.git:
+    repo: "{{ gitea_url }}/coffee-shop-source.git"
+    dest: "{{ workdir }}/coffee-shop-source"
+    update: no
+
+- name: set up nexus_settings.xml mirror url
+  ansible.builtin.replace:
+    path: "{{ workdir }}/coffee-shop-source/nexus_settings.xml"
+    regexp: "OCP_APPS_DOMAIN"
+    replace: "{{ ocp_apps_domain }}"
+
+- name: git commit and push nexus_settings.xml
+  ansible.builtin.shell: |-
+    set -e
+    git -C {{ workdir }}/coffee-shop-source commit -m "Change nexus_settings.xml" nexus_settings.xml || true
+    git -C {{ workdir }}/coffee-shop-source push
+
+- debug:
+    msg: "LAB 01 ENVIRONMENT SETUP - COMPLETED"

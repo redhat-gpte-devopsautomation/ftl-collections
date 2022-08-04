@@ -1,0 +1,280 @@
+jobs:
+  - script: >
+      pipelineJob('Test Agent Pod') {
+        definition {
+          cps {
+            script("""
+              pipeline {
+                agent {
+                  kubernetes {
+                    cloud 'openshift'
+                    yaml \"\"\"
+              apiVersion: v1
+              kind: Pod
+              spec:
+                serviceAccountName: jenkins
+                containers:
+                - name: jnlp
+                  image: image-registry.openshift-image-registry.svc:5000/openshift/jenkins-agent-base:latest
+                  command:
+                  args: ['\\\$computer.jnlpmac', '\\\$computer.name']
+                  workingDir: /tmp
+                  tty: false
+                - name: skopeo
+                  image: quay.io/skopeo/stable:v1.5.2
+                  command:
+                  - cat
+                  tty: true
+                  resources:
+                    requests:
+                      memory: 128Mi
+                      cpu: 100m
+                - name: maven
+                  image: image-registry.openshift-image-registry.svc:5000/openshift/openjdk-11-rhel8:1.0
+                  command:
+                  - cat
+                  tty: true
+                  resources:
+                    requests:
+                      memory: 2Gi
+                      cpu: 1
+              \"\"\"
+                  }
+                }
+                stages {
+                  stage("Test Skopeo") {
+                    steps {
+                      container("skopeo") {
+                        sh "skopeo --version"
+                      }
+                    }
+                  }
+                  stage("Test Maven") {
+                    steps {
+                      container("maven") {
+                        sh "java --version"
+                        sh "mvn --version"
+                      }
+                    }
+                  }
+                }
+              }
+            """.stripIndent())
+            sandbox()
+          }
+        }
+      }
+  - script: >
+      pipelineJob('Quarkus Application Pipeline') {
+        parameters {
+          stringParam {
+            name('OCP_USER')
+            defaultValue('{{ ocp_user }}')
+            description('Your OpenShift User ID')
+            trim(true)
+          }
+          stringParam {
+            name('APP_NAME')
+            defaultValue('coffee-shop')
+            trim(true)
+          }
+          stringParam {
+            name('SOURCE_GIT_URL')
+            defaultValue('{{ gitea_url }}/coffee-shop-source')
+            description('Make sure to use the URL of your repository')
+            trim(true)
+          }
+          stringParam {
+            name('SOURCE_GIT_BRANCH')
+            defaultValue('master')
+            trim(true)
+          }
+          stringParam {
+            name('SOURCE_GIT_CONTEXT_DIR')
+            defaultValue('coffee-shop')
+            trim(true)
+          }
+          stringParam {
+            name('CLUSTER_DOMAIN')
+            defaultValue('{{ ocp_apps_domain }}')
+            description('Make sure to use the URL of your cluster')
+            trim(true)
+          }
+          booleanParam('DEPLOY_SERVERLESS', false)
+        }
+        definition {
+          cps {
+            script("""
+              // OCP_USER must be set as a parameter to this pipeline
+              // Set up Namespaces
+              def namespaceDev  = "\$OCP_USER-dev-coffeeshop"
+              def namespaceProd = "\$OCP_USER-prod-coffeeshop"
+
+              // Set up Nexus Image Registry credentials
+              def nexusRegistryUser     = "admin"
+              def nexusRegistryPassword = "redhat"
+
+              // Set up dev/prod tag place holders
+              def devTag    = "dev-YYYY-MM-DD-HH-MM-SS"
+              def prodTag   = "prod-YYYY-MM-DD-HH-MM-SS"
+
+              pipeline {
+                agent {
+                  kubernetes {
+                    cloud 'openshift'
+                    yaml \"\"\"
+              apiVersion: v1
+              kind: Pod
+              spec:
+                serviceAccountName: jenkins
+                containers:
+                - name: jnlp
+                  image: image-registry.openshift-image-registry.svc:5000/openshift/jenkins-agent-base:latest
+                  command:
+                  args: ['\\\$computer.jnlpmac', '\\\$computer.name']
+                  workingDir: /tmp
+                  tty: false
+                - name: maven
+                  image: image-registry.openshift-image-registry.svc:5000/openshift/openjdk-11-rhel8:1.0
+                  command:
+                  - cat
+                  tty: true
+                  resources:
+                    requests:
+                      memory: 2Gi
+                      cpu: 1
+                - name: skopeo
+                  image: quay.io/skopeo/stable:v1.5.2
+                  command:
+                  - cat
+                  tty: true
+                  resources:
+                    requests:
+                      memory: 128Mi
+                      cpu: 100m
+              \"\"\"
+                  }
+                }
+
+                stages {
+                  stage('Checkout source code') {
+                    steps {
+                      git credentialsId: "\$OCP_USER-jenkins-repo-secret",
+                          url: "\$SOURCE_GIT_URL",
+                          branch: "\$SOURCE_GIT_BRANCH"
+                      script{
+                        // Calculate the current time stamp
+                        def buildTimeStamp = sh(script: "date +'%Y-%m-%d-%H-%M-%S'", returnStdout: true).trim()
+                        // Update image tags based on current time stamp
+                        devTag  = "dev-"+buildTimeStamp
+                        prodTag = "prod-"+buildTimeStamp
+                      }
+                    }
+                  }
+
+                  stage('Build jar file') {
+                    steps {
+                      dir("\$SOURCE_GIT_CONTEXT_DIR") {
+                        container("maven") {
+                          sh "mvn -s ../nexus_settings_openshift.xml clean package -DskipTests=true"
+                        }
+                      }
+                    }
+                  }
+
+                  stage('Build and tag container image') {
+                    steps {
+                      echo "Building container image \$APP_NAME:\$devTag"
+                      dir("\$SOURCE_GIT_CONTEXT_DIR") {
+                        sh "oc start-build \$APP_NAME --from-file=./target/\$APP_NAME-1.0-SNAPSHOT-runner.jar --follow --wait -n \$namespaceDev"
+                        sh "oc tag \$APP_NAME:latest \$APP_NAME:\$devTag -n \$namespaceDev"
+                      }
+                    }
+                  }
+
+                  stage('Deploy to development project (Deployment)') {
+                    when {
+                      environment name: 'DEPLOY_SERVERLESS', value: 'false'
+                    }
+                    steps {
+                      echo "Deploying container image to development project \$namespaceDev"
+                      sh "oc set image deployment \$APP_NAME \$APP_NAME=image-registry.openshift-image-registry.svc:5000/\$namespaceDev/\$APP_NAME:\$devTag -n \$namespaceDev"
+                      sh "oc rollout restart deployment \$APP_NAME -n \$namespaceDev"
+                      sh "oc rollout status deployment \$APP_NAME -n \$namespaceDev"
+                    }
+                  }
+
+                  stage('Deploy to development project (Serverless)') {
+                    when {
+                      environment name: 'DEPLOY_SERVERLESS', value: 'true'
+                    }
+                    steps {
+                      echo "Deploying container image to development project \$namespaceDev"
+                      script {
+                        currentVersion = sh(returnStdout: true, script: "oc get service.serving.knative.dev \$APP_NAME -o jsonpath='{.status.observedGeneration}' -n \$namespaceDev").trim()
+                        sh "oc patch service.serving.knative.dev \$APP_NAME --type='json' --patch='[{\\"op\\": \\"replace\\", \\"path\\": \\"/spec/template/spec/containers/0/image\\", \\"value\\": \\"image-registry.openshift-image-registry.svc:5000/\$namespaceDev/\$APP_NAME:\$devTag\\"},{\\"op\\": \\"replace\\", \\"path\\": \\"/spec/template/metadata/name\\", \\"value\\": \\"\$APP_NAME-\$devTag\\"}]' -n \$namespaceDev"
+                        newVersion = currentVersion
+                        while( newVersion == currentVersion ) {
+                          sleep 1
+                          newVersion = sh(returnStdout: true, script: "oc get service.serving.knative.dev \$APP_NAME -o jsonpath='{.status.observedGeneration}' -n \$namespaceDev").trim()
+                        }
+                      }
+                    }
+                  }
+
+                  stage('Tag container image for production') {
+                    steps {
+                      sh "oc tag \$APP_NAME:\$devTag \$APP_NAME:\$prodTag -n \$namespaceDev"
+                    }
+                  }
+
+                  stage('Publish production image to Nexus container registry') {
+                    steps {
+                      echo "Publish production image to Nexus container registry"
+                      script {
+                        // Run this oc command on the default jnlp container
+                        // to have access to the oc cli
+                        def openshift_token = sh([ script: 'oc whoami -t', returnStdout: true ]).trim()
+                        container("skopeo") {
+                          sh "skopeo copy --src-tls-verify=false --dest-tls-verify=false --src-creds openshift:\$openshift_token --dest-creds \$nexusRegistryUser:\$nexusRegistryPassword docker://image-registry.openshift-image-registry.svc.cluster.local:5000/\$namespaceDev/\$APP_NAME:\$prodTag docker://nexus-registry.nexus.svc.cluster.local:5000/\$OCP_USER-\$APP_NAME:\$prodTag"
+                        }
+                      }
+                    }
+                  }
+
+                  stage('Deploy to production project (Deployment)') {
+                    when {
+                      environment name: 'DEPLOY_SERVERLESS', value: 'false'
+                    }
+                    steps {
+                      echo "Deploying container image to production project \$namespaceProd"
+                      sh "oc set image deployment \$APP_NAME \$APP_NAME=nexus-registry-nexus.\$CLUSTER_DOMAIN/\$OCP_USER-\$APP_NAME:\$prodTag -n \$namespaceProd"
+                      sh "oc rollout restart deployment \$APP_NAME -n \$namespaceProd"
+                      sh "oc rollout status deployment \$APP_NAME -n \$namespaceProd"
+                    }
+                  }
+
+                  stage('Deploy to production project (Serverless)') {
+                    when {
+                      environment name: 'DEPLOY_SERVERLESS', value: 'true'
+                    }
+                    steps {
+                      echo "Deploying container image to production project \$namespaceProd"
+                      script {
+                        currentVersion = sh(returnStdout: true, script: "oc get service.serving.knative.dev \$APP_NAME -o jsonpath='{.status.observedGeneration}' -n \$namespaceProd").trim()
+                        sh "oc patch service.serving.knative.dev \$APP_NAME --type='json' --patch='[{\\"op\\": \\"replace\\", \\"path\\": \\"/spec/template/spec/containers/0/image\\", \\"value\\": \\"nexus-registry-nexus.\$CLUSTER_DOMAIN/\$OCP_USER-\$APP_NAME:\$prodTag\\"},{\\"op\\": \\"replace\\", \\"path\\": \\"/spec/template/metadata/name\\", \\"value\\": \\"\$APP_NAME-\$prodTag\\"}]' -n \$namespaceProd"
+                        newVersion = currentVersion
+                        while( newVersion == currentVersion ) {
+                          sleep 1
+                          newVersion = sh(returnStdout: true, script: "oc get service.serving.knative.dev \$APP_NAME -o jsonpath='{.status.observedGeneration}' -n \$namespaceProd").trim()
+                        }
+                      } // Script
+                    } // Steps
+                  } // Stage
+                } // Stages
+              } // Pipeline
+            """.stripIndent())
+            sandbox()
+          }
+        }
+      }

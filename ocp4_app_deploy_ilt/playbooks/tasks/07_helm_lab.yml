@@ -1,0 +1,209 @@
+---
+- debug:
+    msg: "LAB 07 HELM"
+
+- name: create helm chart coffee-shop-postgresql
+  ansible.builtin.shell: |-
+    helm create {{ workdir }}/coffee-shop-postgresql
+
+- name: patch Chart.yaml helm coffee-shop-postgresql
+  ansible.builtin.lineinfile:
+    path: "{{ workdir }}/coffee-shop-postgresql/Chart.yaml"
+    regexp: "{{ item[0] }}"
+    line: "{{ item[1] }}"
+  loop:
+    - ['^name:', 'name: {{ ocp_user }}-coffee-shop-postgresql']
+    - ['^description:', 'description: A PostgreSQL database for use in the Coffee Shop Microservices application']
+    - ['^version:', 'version: 1.0.0']
+    - ['^appVersion:', 'appVersion: "10"']
+
+- name: patch values.yaml helm coffee-shop-postgresql
+  ansible.builtin.lineinfile:
+    path: "{{ workdir }}/coffee-shop-postgresql/values.yaml"
+    regexp: '^(\s\s)(repository:)'
+    line: '\1repository: image-registry.openshift-image-registry.svc:5000/openshift/postgresql'
+    backrefs: true
+
+- name: patch values.yaml helm coffee-shop-postgresql
+  ansible.builtin.lineinfile:
+    path: "{{ workdir }}/coffee-shop-postgresql/values.yaml"
+    regexp: '^(\s\s)(tag:)'
+    line: '\1tag: "10-el8"'
+    backrefs: true
+
+- name: patch values.yaml helm coffee-shop-postgresql
+  ansible.builtin.replace:
+    path: "{{ workdir }}/coffee-shop-postgresql/values.yaml"
+    regexp: '^autoscaling:((\n[^\S\r\n])+(.)*)*'
+    replace: ""
+
+- name: patch values.yaml helm coffee-shop-postgresql
+  ansible.builtin.replace:
+    path: "{{ workdir }}/coffee-shop-postgresql/values.yaml"
+    regexp: 'ingress:((\n[^\S\r\n])+(.)*)*'
+    replace: ""
+
+- name: patch values.yaml helm coffee-shop-postgresql
+  ansible.builtin.replace:
+    path: "{{ workdir }}/coffee-shop-postgresql/values.yaml"
+    regexp: 'service:((\n[^\S\r\n])+(.)*)*'
+    replace: 'service:\n  name: postgresql\n  type: ClusterIP\n  port: 5432\n  targetPort: 5432\n  protocol: TCP\n'
+
+- name: patch values.yaml helm coffee-shop-postgresql
+  ansible.builtin.replace:
+    path: "{{ workdir }}/coffee-shop-postgresql/values.yaml"
+    regexp: 'resources:\s{}((\n[^\S\r\n])+(.)*)*'
+    replace: 'resources:\n  requests:\n    memory: 256Mi\n    cpu: 100m\n  limits:\n    memory: 512Mi\n    cpu: 200m\n'
+
+- name: patch values.yaml helm coffee-shop-postgresql
+  ansible.builtin.blockinfile:
+    path: "{{ workdir }}/coffee-shop-postgresql/values.yaml"
+    block: |
+      pvc:
+        size: 1Gi
+        accessModes:
+        - ReadWriteOnce
+    marker: "# {mark} PVC"
+- name: patch values.yaml helm coffee-shop-postgresql
+  ansible.builtin.blockinfile:
+    path: "{{ workdir }}/coffee-shop-postgresql/values.yaml"
+    block: |
+      credentials:
+        database: ""
+        username: ""
+        password: ""
+    marker: "# {mark} DATABASE CREDENTIALS"
+
+- name: patch values.yaml helm coffee-shop-postgresql
+  ansible.builtin.lineinfile:
+    path: "{{ workdir }}/coffee-shop-postgresql/values.yaml"
+    regexp: '^openshiftApplicationName:'
+    line: 'openshiftApplicationName: postgresql'
+
+- name: remove helm template files that are not required
+  ansible.builtin.file:
+    path: "{{ workdir }}/coffee-shop-postgresql/templates/{{ item }}"
+    state: absent
+  loop:
+    - hpa.yaml
+    - ingress.yaml
+    - NOTES.txt
+    - tests
+
+- name: patch service.yaml helm coffee-shop-postgresql
+  ansible.builtin.lineinfile:
+    path: "{{ workdir }}/coffee-shop-postgresql/templates/service.yaml"
+    regexp: '^(\s+)(targetPort:)'
+    line: '\1targetPort: {{ "{{" }} .Values.service.targetPort {{ "}}" }}'
+    backrefs: true
+
+- name: patch service.yaml helm coffee-shop-postgresql
+  ansible.builtin.lineinfile:
+    path: "{{ workdir }}/coffee-shop-postgresql/templates/service.yaml"
+    regexp: '^(\s+)(protocol:)'
+    line: '\1protocol: {{ "{{" }} .Values.service.protocol {{ "}}" }}'
+    backrefs: true
+
+- name: patch service.yaml helm coffee-shop-postgresql
+  ansible.builtin.lineinfile:
+    path: "{{ workdir }}/coffee-shop-postgresql/templates/service.yaml"
+    regexp: '^(\s+)(name:)'
+    line: '\1name: {{ "{{" }} .Values.service.name {{ "}}" }}'
+    backrefs: true
+
+- name: copy template files helm coffee-shop-postgresql
+  ansible.builtin.copy:
+    src: 07_helm_lab/{{ item }}
+    dest: "{{ workdir }}/coffee-shop-postgresql/templates/{{ item }}"
+  loop:
+    - pvc.yaml
+    - secret.yaml
+    - deployment.yaml
+
+- import_tasks: ./100_create_project_namespace.yml
+  vars:
+    ocp_project: "{{ test_database }}"
+
+- block:
+    - name: find helm chart package
+      ansible.builtin.find:
+        paths: "{{ workdir }}/coffee-shop-postgresql/charts"
+        patterns: "*.tgz"
+      register: find_results
+    - name: remove helm chart package
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ find_results.files }}"
+    - name: install helm chart coffee-shop-postgresql from file (dry-run)
+      ansible.builtin.shell: |-
+        helm install coffee-shop-postgresql {{ workdir }}/coffee-shop-postgresql --set-string credentials.database=coffee,credentials.username=coffee,credentials.password=coffee,openshiftApplicationName=coffee-shop,fullnameOverride=coffee-shop-database -n {{ test_database }} --dry-run
+    - name: install helm chart coffee-shop-postgresql from file
+      ansible.builtin.shell: |-
+        helm install coffee-shop-postgresql {{ workdir }}/coffee-shop-postgresql --set-string credentials.database=coffee,credentials.username=coffee,credentials.password=coffee,openshiftApplicationName=coffee-shop,fullnameOverride=coffee-shop-database -n {{ test_database }} --wait --timeout 60s
+
+- name: wait deployment coffee-shop-postgresql
+  kubernetes.core.k8s_info:
+    kind: Deployment
+    name: coffee-shop-postgresql
+    namespace: "{{ test_database }}"
+    wait: yes
+    wait_timeout: 60
+
+- name: uninstall helm chart coffee-shop-postgresql
+  ansible.builtin.shell: |-
+    helm uninstall coffee-shop-postgresql -n {{ test_database }}
+
+- name: package helm chart coffee-shop-postgresql
+  ansible.builtin.shell: |-
+    helm package {{ workdir }}/coffee-shop-postgresql --destination {{ workdir }}/coffee-shop-postgresql/charts
+
+- name: upload helm chart coffee-shop-postgresql to nexus
+  ansible.builtin.shell: |-
+    curl -v https://nexus-nexus.{{ ocp_apps_domain }}/repository/helm/ --user admin:redhat --upload-file {{ workdir }}/coffee-shop-postgresql/charts/{{ ocp_user }}-coffee-shop-postgresql-1.0.0.tgz
+
+- name: add helm repository nexus locally
+  ansible.builtin.shell: |-
+    helm repo add nexus --force-update --username admin --password redhat "https://nexus-nexus.{{ ocp_apps_domain }}/repository/helm"
+
+- name: update and verify helm chart is available
+  ansible.builtin.shell: >-
+    helm repo update
+    && helm search repo nexus --output json | jq -c 'map(select(.name | contains("nexus/{{ ocp_user }}-coffee-shop-postgresql"))|.name)[0]'
+  register: this
+  until: this.rc == 0 and 'coffee-shop-postgresql' in this.stdout
+  retries: 3
+  delay: 10
+
+- name: install helm chart coffee-shop-postgresql from nexus repo
+  ansible.builtin.shell: |-
+    helm install coffee-shop-postgresql nexus/{{ ocp_user }}-coffee-shop-postgresql --set credentials.database=coffee,credentials.username=coffee,credentials.password=coffee,openshiftApplicationName=coffee-shop,fullnameOverride=coffee-shop-database -n {{ test_database }} --wait --timeout 60s
+
+- name: wait deployment coffee-shop-postgresql
+  kubernetes.core.k8s_info:
+    kind: Deployment
+    name: coffee-shop-postgresql
+    namespace: "{{ test_database }}"
+    wait: yes
+    wait_timeout: 60
+
+- name: uninstall helm chart coffee-shop-postgresql
+  ansible.builtin.shell: |-
+    helm uninstall coffee-shop-postgresql -n {{ test_database }}
+
+- name: delete project {{ test_database }}
+  ansible.builtin.shell: |-
+    oc delete project {{ test_database }}
+  ignore_errors: true
+
+- name: copy .gitignore coffee-shop-postgresql
+  ansible.builtin.copy:
+    src: 07_helm_lab/.gitignore
+    dest: "{{ workdir }}/coffee-shop-postgresql/.gitignore"
+
+- import_tasks: ./100_create_git_repo_push.yml
+  vars:
+    repo_name: coffee-shop-postgresql
+
+- debug:
+    msg: "LAB 07 HELM - COMPLETED"

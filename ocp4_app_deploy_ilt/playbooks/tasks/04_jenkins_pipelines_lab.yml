@@ -1,0 +1,235 @@
+---
+- debug:
+    msg: "LAB 04 JENKINS PIPELINES"
+
+- name: create project {{ jenkins }}
+  ansible.builtin.shell: |-
+    oc new-project {{ jenkins }} --display-name="Jenkins for {{ ocp_user }}"
+  register: this
+  failed_when: this.rc != 0 and 'AlreadyExists' not in this.stderr
+
+- name: select project {{ dev }}
+  ansible.builtin.shell: |-
+    oc project {{ dev }}
+
+- name: create new-app jenkins-persistent
+  ansible.builtin.shell: |-
+    oc new-app jenkins-persistent --dry-run --output yaml | oc apply -n {{ jenkins }} --overwrite -f -
+
+- name: wait deployment jenkins
+  kubernetes.core.k8s_info:
+    api_version: apps.openshift.io/v1
+    kind: DeploymentConfig
+    name: jenkins
+    namespace: "{{ jenkins }}"
+  register: this
+  until:
+    - this.resources[0].status.readyReplicas is defined
+    - this.resources[0].status.readyReplicas | int >= 1
+  retries: 20
+  delay: 5
+
+- name: add policy edit to jenkins in dev and prod projects
+  ansible.builtin.shell: |-
+    set -e
+    oc policy add-role-to-user edit system:serviceaccount:{{ jenkins }}:jenkins --rolebinding-name=jenkins-edit -n {{ dev }}
+    oc policy add-role-to-user edit system:serviceaccount:{{ jenkins }}:jenkins --rolebinding-name=jenkins-edit -n {{ prod }}
+
+- name: create secret repo-secret for jenkins
+  ansible.builtin.shell: |-
+    set -e
+    oc create secret generic repo-secret --type "kubernetes.io/basic-auth" --from-literal=username={{ ocp_user }} --from-literal=password={{ ocp_password }} --dry-run=client --output yaml | oc apply -n {{ jenkins }} --overwrite -f -
+    oc label secret repo-secret credential.sync.jenkins.openshift.io=true --overwrite -n {{ jenkins }}
+
+- name: remove triggers deployment coffee-shop
+  ansible.builtin.shell: |-
+    oc annotate deploy coffee-shop image.openshift.io/triggers- -n {{ dev }}
+
+- name: create new-app postgresql-persistent database in {{ prod }}
+  ansible.builtin.shell: |-
+    set -e
+    oc new-app postgresql-persistent --param DATABASE_SERVICE_NAME=coffee-shop-database --param POSTGRESQL_USER=coffee --param POSTGRESQL_PASSWORD=coffee --param POSTGRESQL_DATABASE=coffeeshop --dry-run --output yaml | oc apply -n {{ prod }} --overwrite -f -
+    oc label dc coffee-shop-database app.kubernetes.io/part-of=coffee-shop app.openshift.io/runtime=postgresql --overwrite -n {{ prod }}
+
+- name: create secret coffee-shop in {{ prod }}
+  ansible.builtin.shell: >-
+    oc create secret generic coffee-shop
+    --from-literal=quarkus.datasource.db-kind=postgresql
+    --from-literal=quarkus.datasource.jdbc.url=jdbc:postgresql://coffee-shop-database:5432/coffeeshop
+    --from-literal=quarkus.datasource.username=coffee
+    --from-literal=quarkus.datasource.password=coffee
+    --dry-run --output yaml | oc apply -n {{ prod }} --overwrite -f -
+
+- name: create configmap coffee-shop in {{ prod }}
+  ansible.builtin.shell: |-
+    oc create configmap coffee-shop --from-literal=BARISTA_URL=http://barista.{{ prod }}.svc.cluster.local/processes --dry-run --output yaml | oc apply -n {{ prod }} --overwrite -f -
+
+- name: create new-app coffee-shop in {{ prod }}
+  ansible.builtin.shell: >-
+    oc new-app coffee-shop:prod-0
+    --name=coffee-shop
+    --allow-missing-images=true
+    --labels=app.kubernetes.io/part-of=coffee-shop,app.openshift.io/runtime=quarkus
+    --dry-run --output yaml | oc apply -n {{ prod }} --overwrite -f -
+
+- name: remove triggers deployment coffee-shop in {{ prod }}
+  ansible.builtin.shell: |-
+    oc annotate deploy coffee-shop image.openshift.io/triggers- -n {{ prod }}
+
+- name: set deployment env coffee-shop from configmap and secret in {{ prod }}
+  ansible.builtin.shell: |-
+    set -e
+    oc set env deploy coffee-shop --from=secret/coffee-shop --overwrite -n {{ prod }}
+    oc set env deploy coffee-shop --from=configmap/coffee-shop --overwrite -n {{ prod }}
+
+- name: set health check probes to coffee-shop in {{ prod }}
+  ansible.builtin.shell: |-
+    set -e
+    oc set probe deploy/coffee-shop --readiness --get-url=http://:8080/health -n {{ prod }}
+    oc set probe deploy/coffee-shop --liveness --get-url=http://:8080/health -n {{ prod }}
+
+- name: set resource requests to coffee-shop in {{ prod }}
+  ansible.builtin.shell: |-
+    oc set resources deploy/coffee-shop --requests=cpu=100m,memory=384Mi -n {{ prod }}
+
+- name: annotate deployment coffee-shop in {{ prod }}
+  ansible.builtin.shell: |-
+    oc annotate deploy coffee-shop app.openshift.io/connects-to='["coffee-shop-database",{"apiVersion":"apps/v1","kind":"Deployment","name":"coffee-shop-database"},{"apiVersion":"serving.knative.dev/v1","kind":"Service","name":"barista"},{"apiVersion":"apps.openshift.io/v1","kind":"DeploymentConfig","name":"coffee-shop-database"}]' --overwrite -n {{ prod }}
+
+- name: expose service and route coffe-shop in {{ prod }}
+  ansible.builtin.shell: |-
+    set -e
+    oc expose deploy coffee-shop --port 8080 --dry-run --output yaml -n {{ prod }} | oc apply -n {{ prod }} --overwrite -f -
+    oc expose service coffee-shop --dry-run --output yaml -n {{ prod }} | oc apply -n {{ prod }} --overwrite -f -
+
+- name: create knative service barista placeholder
+  ansible.builtin.shell: >-
+    kn service create barista
+    --image knativesamples/helloworld:latest
+    --label app.openshift.io/runtime=quarkus
+    --label app.kubernetes.io/part-of=coffee-shop
+    --port 8080
+    --cluster-local
+    --request cpu=100m,memory=256Mi
+    --force
+    --namespace {{ prod }}
+
+- name: wait pod jenkins
+  kubernetes.core.k8s_info:
+    kind: Pod
+    namespace: "{{ jenkins }}"
+    label_selectors:
+      - name = jenkins
+    wait: yes
+    wait_timeout: 120
+  register: jenkins_pod
+
+- name: create jenkins-casc.yaml file
+  ansible.builtin.template:
+    src: 04_jenkins_lab/jenkins-casc.yaml.j2
+    dest: "{{ workdir }}/jenkins-casc.yaml"
+
+- name: copy into pod jenkins-casc.yaml file
+  ansible.builtin.shell: |-
+    oc cp {{ workdir }}/jenkins-casc.yaml {{ jenkins_pod.resources[0].metadata.name }}:/var/lib/jenkins/jenkins-casc.yaml -n {{ jenkins }}
+
+- name: set env jenkins CASC_JENKINS_CONFIG
+  ansible.builtin.shell: |-
+    oc set env dc/jenkins CASC_JENKINS_CONFIG=/var/lib/jenkins/jenkins-casc.yaml -n {{ jenkins }}
+
+# Required pause so deployment can automatically restart after previous step 'set env'
+- name: pause for deployment jenkins
+  ansible.builtin.pause:
+    seconds: 5
+
+- name: wait deployment jenkins
+  kubernetes.core.k8s_info:
+    api_version: apps.openshift.io/v1
+    kind: DeploymentConfig
+    name: jenkins
+    namespace: "{{ jenkins }}"
+  register: this
+  until:
+    - this.resources[0].status.readyReplicas is defined
+    - this.resources[0].status.readyReplicas | int >= 1
+  retries: 20
+  delay: 5
+
+- name: get route jenkins
+  kubernetes.core.k8s_info:
+    api_version: route.openshift.io/v1
+    kind: Route
+    name: jenkins
+    namespace: "{{ jenkins }}"
+  register: jenkins_route
+
+- name: get jenkins access token
+  ansible.builtin.shell: |-
+    oc get secret $(oc get sa jenkins -o jsonpath="{ .secrets }" -n {{ jenkins }} | jq -c 'map(select(.name | contains("token"))|.name)[0]' | tr -d '"') -o=template="{{ '{{' }} .data.token | base64decode {{ '}}' }}" -n {{ jenkins }}
+  register: jenkins_token
+
+- name: trigger jenkins build coffee-shop
+  ansible.builtin.uri:
+    url: https://{{ jenkins_route.resources[0].spec.host }}/job/Quarkus%20Application%20Pipeline/buildWithParameters
+    method: POST
+    headers:
+      Authorization: Bearer {{ jenkins_token.stdout }}
+    body_format: form-urlencoded
+    body:
+      OCP_USER: "{{ ocp_user }}"
+      APP_NAME: coffee-shop
+      SOURCE_GIT_URL: "{{ gitea_url }}/coffee-shop-source"
+      SOURCE_GIT_CONTEXT_DIR: coffee-shop
+      CLUSTER_DOMAIN: "{{ ocp_apps_domain }}"
+    status_code: 201
+  register: this
+  until: this.status == 201
+  retries: 3
+  delay: 5
+
+- name: trigger jenkins build barista
+  ansible.builtin.uri:
+    url: https://{{ jenkins_route.resources[0].spec.host }}/job/Quarkus%20Application%20Pipeline/buildWithParameters
+    method: POST
+    headers:
+      Authorization: Bearer {{ jenkins_token.stdout }}
+    body_format: form-urlencoded
+    body:
+      OCP_USER: "{{ ocp_user }}"
+      APP_NAME: barista
+      SOURCE_GIT_URL: "{{ gitea_url }}/coffee-shop-source"
+      SOURCE_GIT_CONTEXT_DIR: barista
+      CLUSTER_DOMAIN: "{{ ocp_apps_domain }}"
+      DEPLOY_SERVERLESS: true
+    status_code: 201
+  register: this
+  until: this.status == 201
+  retries: 3
+  delay: 5
+
+# Workaround pause so we can pickup the correct /lastBuild later in the 'wait' task.
+- name: pause for jenkins build queue
+  ansible.builtin.pause:
+    seconds: 10
+
+- debug:
+    msg:
+      - Explore Jenkins in your browser using your OpenShift credentials.
+      - https://{{ jenkins_route.resources[0].spec.host }}
+
+- name: wait jenkins build is success
+  ansible.builtin.uri:
+    url: https://{{ jenkins_route.resources[0].spec.host }}/job/Quarkus%20Application%20Pipeline/lastBuild/api/json
+    headers:
+      Authorization: Bearer {{ jenkins_token.stdout }}
+    return_content: true
+  register: this
+  until: this.json.building is defined and this.json.building == false
+  retries: 50
+  delay: 10
+  failed_when:
+    - this.json.result is defined
+    - this.json.result != "SUCCESS"
+
+- debug:
+    msg: "LAB 04 JENKINS PIPELINES - COMPLETED"

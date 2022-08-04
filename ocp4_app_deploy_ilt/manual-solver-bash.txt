@@ -1,0 +1,1135 @@
+-------------------------------------------------------------------------------
+00 README
+-------------------------------------------------------------------------------
+
+This file contains all the manual steps in bash to solve the labs from start to
+finish.
+
+The instructions provided here were the main input while building the ansible
+tasks.
+
+-------------------------------------------------------------------------------
+01 Setup
+-------------------------------------------------------------------------------
+
+eval $(
+echo "export MY_USER=userX"
+echo "export MY_PASSWORD=password"
+echo "export SANDBOX=sandbox123"
+echo "export GUID=abcxy"
+)
+
+eval $(
+echo "export WORKDIR=${HOME}/redhat/appdev-${GUID}-${MY_USER}"
+echo "export OCP_APPS_DOMAIN=apps.cluster-${GUID}.${GUID}.${SANDBOX}.opentlc.com"
+)
+
+mkdir -p ${WORKDIR}
+
+oc login -u ${MY_USER} -p ${MY_PASSWORD} "https://api.cluster-${GUID}.${GUID}.${SANDBOX}.opentlc.com:6443"
+
+git clone "https://${MY_USER}:${MY_PASSWORD}@gitea.${OCP_APPS_DOMAIN}/${MY_USER}/coffee-shop-source.git" ${WORKDIR}/coffee-shop-source
+
+sed -i '' -e "s/OCP_APPS_DOMAIN/${OCP_APPS_DOMAIN}/g" ${WORKDIR}/coffee-shop-source/nexus_settings.xml
+
+git -C ${WORKDIR}/coffee-shop-source commit -m "Change nexus_settings.xml" nexus_settings.xml && git -C ${WORKDIR}/coffee-shop-source push
+
+-------------------------------------------------------------------------------
+02 Kubernetes Patterns Lab
+-------------------------------------------------------------------------------
+
+oc new-project ${MY_USER}-prod-coffeeshop --display-name="Coffee Shop for ${MY_USER} (Production)"
+oc new-project ${MY_USER}-dev-coffeeshop --display-name="Coffee Shop for ${MY_USER} (Development)"
+
+oc new-app postgresql-persistent --param DATABASE_SERVICE_NAME=coffee-shop-database --param POSTGRESQL_USER=coffee --param POSTGRESQL_PASSWORD=coffee --param POSTGRESQL_DATABASE=coffeeshop
+oc label dc coffee-shop-database app.kubernetes.io/part-of=coffee-shop app.openshift.io/runtime=postgresql
+
+oc create secret generic gitea-secret --from-literal=username=${MY_USER} --from-literal=password=${MY_PASSWORD}
+
+oc new-app openshift/ubi8-openjdk-11:1.3~https://gitea.${OCP_APPS_DOMAIN}/${MY_USER}/coffee-shop-source.git \
+  --name=barista \
+  --context-dir=barista \
+  --source-secret=gitea-secret \
+  --build-env=MAVEN_MIRROR_URL=http://nexus.nexus.svc:8081/repository/maven-all-public/ \
+  --labels=app.kubernetes.io/part-of=coffee-shop,app.openshift.io/runtime=quarkus
+
+
+oc expose service barista -n ${OCP_USER}-dev-coffeeshop
+curl http://$(oc get route barista --template='{{ .spec.host }}' -n ${OCP_USER}-dev-coffeeshop)/health ; echo
+oc delete route barista -n ${OCP_USER}-dev-coffeeshop
+
+
+oc new-app openshift/ubi8-openjdk-11:1.3~https://gitea.${OCP_APPS_DOMAIN}/${MY_USER}/coffee-shop-source.git \
+  --name=coffee-shop \
+  --context-dir=coffee-shop \
+  --source-secret=gitea-secret \
+  --build-env=MAVEN_MIRROR_URL=http://nexus.nexus.svc:8081/repository/maven-all-public/ \
+  --labels=app.kubernetes.io/part-of=coffee-shop,app.openshift.io/runtime=quarkus
+
+oc create secret generic coffee-shop \
+  --from-literal=quarkus.datasource.db-kind=postgresql \
+  --from-literal=quarkus.datasource.jdbc.url=jdbc:postgresql://coffee-shop-database:5432/coffeeshop \
+  --from-literal=quarkus.datasource.username=coffee \
+  --from-literal=quarkus.datasource.password=coffee
+
+oc create configmap coffee-shop --from-literal=BARISTA_URL=http://barista:8080/processes
+
+oc set env deploy coffee-shop --from=secret/coffee-shop
+oc set env deploy coffee-shop --from=configmap/coffee-shop
+
+oc annotate deploy coffee-shop app.openshift.io/connects-to='["coffee-shop-database",{"apiVersion":"apps.openshift.io/v1","kind":"DeploymentConfig","name":"coffee-shop-database"},{"apiVersion":"apps/v1","kind":"Deployment","name":"barista"}]'
+
+oc expose service coffee-shop
+
+curl http://$(oc get route coffee-shop --template='{{ .spec.host }}')/health
+curl http://$(oc get route coffee-shop --template='{{ .spec.host }}')/types | jq
+
+
+oc set probe deploy/barista --readiness --get-url=http://:8080/health
+oc set probe deploy/barista --liveness --get-url=http://:8080/health
+oc set probe deploy/coffee-shop --readiness --get-url=http://:8080/health
+oc set probe deploy/coffee-shop --liveness --get-url=http://:8080/health
+
+oc set resources deploy/barista --requests=cpu=100m,memory=256Mi
+oc set resources deploy/coffee-shop --requests=cpu=100m,memory=384Mi
+
+open "http://$(oc get route coffee-shop --template='{{ .spec.host }}')/index.html"
+
+-------------------------------------------------------------------------------
+03 Serverless and Advanced Builds Lab
+-------------------------------------------------------------------------------
+
+oc delete all --selector=app.openshift.io/runtime=quarkus
+
+oc delete secret gitea-secret
+
+mvn clean package -f ${WORKDIR}/coffee-shop-source/barista -s ${WORKDIR}/coffee-shop-source/nexus_settings.xml -DskipTest
+
+oc new-build --name barista --binary --image-stream openshift/ubi8-openjdk-11:1.3 --labels app.kubernetes.io/name=coffee-shop,app.openshift.io/runtime=quarkus
+
+oc start-build barista --from-file=${WORKDIR}/coffee-shop-source/barista/target/barista-1.0-SNAPSHOT-runner.jar --follow
+
+oc new-app ${MY_USER}-dev-coffeeshop/barista:latest --labels app.kubernetes.io/part-of=coffee-shop,app.openshift.io/runtime=quarkus
+
+oc set probe deploy/barista --readiness --get-url=http://:8080/health
+oc set probe deploy/barista --liveness --get-url=http://:8080/health
+
+oc set resources deploy/barista --requests=cpu=100m,memory=256Mi
+
+oc expose service barista
+curl "http://$(oc get route barista --template='{{ .spec.host }}')/health"
+oc delete route barista
+
+mvn clean package -f ${WORKDIR}/coffee-shop-source/coffee-shop -s ${WORKDIR}/coffee-shop-source/nexus_settings.xml -DskipTests
+
+oc new-build --name coffee-shop --binary --image-stream openshift/ubi8-openjdk-11:1.3 --labels app.kubernetes.io/name=coffee-shop,app.openshift.io/runtime=quarkus
+
+oc start-build coffee-shop --from-file=${WORKDIR}/coffee-shop-source/coffee-shop/target/coffee-shop-1.0-SNAPSHOT-runner.jar --follow
+
+oc new-app ${MY_USER}-dev-coffeeshop/coffee-shop:latest --labels app.kubernetes.io/part-of=coffee-shop,app.openshift.io/runtime=quarkus
+
+oc set probe deploy/coffee-shop --readiness --get-url=http://:8080/health
+oc set probe deploy/coffee-shop --liveness --get-url=http://:8080/health
+
+oc set resources deploy/coffee-shop --requests=cpu=100m,memory=384Mi
+
+oc set env deploy coffee-shop --from=secret/coffee-shop
+oc set env deploy coffee-shop --from=configmap/coffee-shop
+
+oc annotate deploy coffee-shop app.openshift.io/connects-to='["coffee-shop-database",{"apiVersion":"apps.openshift.io/v1","kind":"DeploymentConfig","name":"coffee-shop-database"},{"apiVersion":"apps/v1","kind":"Deployment","name":"barista"}]'
+
+oc expose service coffee-shop
+
+curl "http://$(oc get route coffee-shop --template='{{ .spec.host }}')/health"
+
+# serverless
+
+oc delete deploy/barista service/barista
+
+kn service create barista \
+  --image image-registry.openshift-image-registry.svc:5000/${MY_USER}-dev-coffeeshop/barista:latest \
+  --label app.openshift.io/runtime=quarkus \
+  --label app.kubernetes.io/part-of=coffee-shop \
+  --port 8080 \
+  --cluster-local \
+  --request cpu=100m,memory=256Mi
+
+oc delete configmap coffee-shop
+oc create configmap coffee-shop --from-literal=BARISTA_URL=http://barista.${MY_USER}-dev-coffeeshop.svc.cluster.local/processes
+
+oc delete pod -l deployment=coffee-shop
+
+oc annotate deploy coffee-shop app.openshift.io/connects-to='["coffee-shop-database",{"apiVersion":"apps/v1","kind":"Deployment","name":"coffee-shop-database"},{"apiVersion":"serving.knative.dev/v1","kind":"Service","name":"barista"},{"apiVersion":"apps.openshift.io/v1","kind":"DeploymentConfig","name":"coffee-shop-database"}]' --overwrite
+
+-------------------------------------------------------------------------------
+04 Jenkins Pipelines Lab
+-------------------------------------------------------------------------------
+
+oc new-project ${MY_USER}-jenkins --display-name="Jenkins for ${MY_USER}"
+
+oc new-app jenkins-persistent -n ${MY_USER}-jenkins
+
+sleep 120
+
+oc exec $(oc get pod -l name=jenkins -o name) -- bash -c "curl -s https://gist.githubusercontent.com/juliaaano/26ed0928d278470e1e25c049d1ef9892/raw/4fd2795be6bc7655d9780595e6d55e8fa2bc92ff/jenkins-casc.yaml > /var/lib/jenkins/jenkins-casc.yaml"
+
+oc set env dc/jenkins CASC_JENKINS_CONFIG=/var/lib/jenkins/jenkins-casc.yaml
+
+oc policy add-role-to-user edit \
+  system:serviceaccount:${MY_USER}-jenkins:jenkins \
+  --rolebinding-name=jenkins-edit \
+  -n ${MY_USER}-dev-coffeeshop
+
+oc policy add-role-to-user edit \
+  system:serviceaccount:${MY_USER}-jenkins:jenkins \
+  --rolebinding-name=jenkins-edit \
+  -n ${MY_USER}-prod-coffeeshop
+
+oc create secret generic repo-secret --type "kubernetes.io/basic-auth" --from-literal=username=${MY_USER} --from-literal=password=${MY_PASSWORD}
+oc label secret repo-secret credential.sync.jenkins.openshift.io=true
+
+oc annotate deploy coffee-shop image.openshift.io/triggers- -n ${MY_USER}-dev-coffeeshop
+
+oc new-app postgresql-persistent \
+  --param DATABASE_SERVICE_NAME=coffee-shop-database \
+  --param POSTGRESQL_USER=coffee \
+  --param POSTGRESQL_PASSWORD=coffee \
+  --param POSTGRESQL_DATABASE=coffeeshop \
+  -n ${MY_USER}-prod-coffeeshop
+
+oc label dc coffee-shop-database app.kubernetes.io/part-of=coffee-shop app.openshift.io/runtime=postgresql -n ${MY_USER}-prod-coffeeshop
+
+oc create secret generic coffee-shop \
+  --from-literal=quarkus.datasource.db-kind=postgresql \
+  --from-literal=quarkus.datasource.jdbc.url=jdbc:postgresql://coffee-shop-database:5432/coffeeshop \
+  --from-literal=quarkus.datasource.username=coffee \
+  --from-literal=quarkus.datasource.password=coffee \
+  -n ${MY_USER}-prod-coffeeshop
+
+oc create configmap coffee-shop --from-literal=BARISTA_URL=http://barista.${MY_USER}-prod-coffeeshop.svc.cluster.local/processes -n ${MY_USER}-prod-coffeeshop
+
+oc new-app coffee-shop:prod-0 --name=coffee-shop --allow-missing-images=true --labels=app.kubernetes.io/part-of=coffee-shop,app.openshift.io/runtime=quarkus -n ${MY_USER}-prod-coffeeshop
+
+oc annotate deploy coffee-shop image.openshift.io/triggers- -n ${MY_USER}-prod-coffeeshop
+
+oc set env deploy coffee-shop --from=secret/coffee-shop -n ${MY_USER}-prod-coffeeshop
+oc set env deploy coffee-shop --from=configmap/coffee-shop -n ${MY_USER}-prod-coffeeshop
+
+oc set probe deploy/coffee-shop --readiness --get-url=http://:8080/health -n ${MY_USER}-prod-coffeeshop
+oc set probe deploy/coffee-shop --liveness --get-url=http://:8080/health -n ${MY_USER}-prod-coffeeshop
+
+oc set resources deploy/coffee-shop --requests=cpu=100m,memory=384Mi -n ${MY_USER}-prod-coffeeshop
+
+oc annotate deploy coffee-shop app.openshift.io/connects-to='["coffee-shop-database",{"apiVersion":"apps/v1","kind":"Deployment","name":"coffee-shop-database"},{"apiVersion":"serving.knative.dev/v1","kind":"Service","name":"barista"},{"apiVersion":"apps.openshift.io/v1","kind":"DeploymentConfig","name":"coffee-shop-database"}]' -n ${MY_USER}-prod-coffeeshop
+
+# Create the Service (necessary because we did not have an image yet to get the EXPOSE from)
+oc expose deploy coffee-shop --port 8080 -n ${MY_USER}-prod-coffeeshop
+
+oc expose service coffee-shop -n ${MY_USER}-prod-coffeeshop
+
+kn service create barista \
+  --image knativesamples/helloworld:latest \
+  --label app.openshift.io/runtime=quarkus \
+  --label app.kubernetes.io/part-of=coffee-shop \
+  --port 8080 \
+  --cluster-local \
+  --request cpu=100m,memory=256Mi \
+  -n ${MY_USER}-prod-coffeeshop
+
+export jenkins_token=$(oc get secret $(oc get sa jenkins -o jsonpath="{ .secrets }" | jq -c 'map(select(.name | contains("token"))|.name)[0]' | tr -d '"') -o=template="{{ .data.token | base64decode }}")
+
+curl -v "https://$(oc get route jenkins --template='{{ .spec.host }}' -n ${MY_USER}-jenkins)/job/Quarkus%20Application%20Pipeline/buildWithParameters" \
+  --header "Authorization: Bearer $jenkins_token" \
+  --data "OCP_USER=${MY_USER}" \
+  --data "APP_NAME=coffee-shop" \
+  --data "SOURCE_GIT_URL=https://gitea.${OCP_APPS_DOMAIN}/${MY_USER}/coffee-shop-source" \
+  --data "SOURCE_GIT_CONTEXT_DIR=coffee-shop" \
+  --data "CLUSTER_DOMAIN=apps.cluster-${GUID}.${GUID}.${SANDBOX}.opentlc.com"
+
+curl -v "https://$(oc get route jenkins --template='{{ .spec.host }}' -n ${MY_USER}-jenkins)/job/Quarkus%20Application%20Pipeline/buildWithParameters" \
+  --header "Authorization: Bearer $jenkins_token" \
+  --data "OCP_USER=${MY_USER}" \
+  --data "APP_NAME=barista" \
+  --data "SOURCE_GIT_URL=https://gitea.${OCP_APPS_DOMAIN}/${MY_USER}/coffee-shop-source" \
+  --data "SOURCE_GIT_CONTEXT_DIR=barista" \
+  --data "CLUSTER_DOMAIN=apps.cluster-${GUID}.${GUID}.${SANDBOX}.opentlc.com" \
+  --data "DEPLOY_SERVERLESS=true"
+
+# Wait for pipeline status?
+
+-------------------------------------------------------------------------------
+05 GitOps Lab
+-------------------------------------------------------------------------------
+
+mkdir -p ${WORKDIR}/coffee-shop-yaml/coffee-shop
+mkdir -p ${WORKDIR}/coffee-shop-yaml/coffee-shop-database
+mkdir -p ${WORKDIR}/coffee-shop-yaml/barista
+
+oc project ${MY_USER}-dev-coffeeshop
+
+oc get deployment coffee-shop -o yaml | oc neat > ${WORKDIR}/coffee-shop-yaml/coffee-shop/deployment.yaml
+
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/deployment.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/annotations/deployment.kubernetes.io~1revision"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/deployment.yaml
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/deployment.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/annotations/image.openshift.io~1triggers"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/deployment.yaml
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/deployment.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/annotations/openshift.io~1generated-by"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/deployment.yaml
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/deployment.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/namespace"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/deployment.yaml
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/deployment.yaml --type=json --patch='[{"op": "remove", "path": "/spec/template/metadata/annotations"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/deployment.yaml
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/deployment.yaml --type=json --patch='[{"op": "remove", "path": "/spec/template/metadata/creationTimestamp"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/deployment.yaml
+
+deployment=$(oc annotate --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/deployment.yaml app.openshift.io/connects-to='["coffee-shop-database",{"apiVersion":"apps/v1","kind":"Deployment","name":"coffee-shop-database"},{"apiVersion":"serving.knative.dev/v1","kind":"Service","name":"barista"}]' --overwrite --local=true --dry-run=client -o yaml) && echo "$deployment" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/deployment.yaml
+
+export coffee_shop_latest=$(podman search nexus-registry-nexus.${OCP_APPS_DOMAIN}/${MY_USER}-coffee-shop --format json | jq '.[-1].Name' | cut -d "/" -f "2,3" | tr -d '"')
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/deployment.yaml --type=json --patch="[{\"op\": \"replace\", \"path\": \"/spec/template/spec/containers/0/image\",\"value\": $coffee_shop_latest}]" --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/deployment.yaml
+#deployment=$(oc set image --filename ${WORKDIR}/coffee-shop-yaml/coffee-shop/deployment.yaml coffee-shop=$coffee_shop_latest --local=true --dry-run=client -o yaml) && echo "$deployment" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/deployment.yaml
+
+oc get service coffee-shop -o yaml | oc neat > ${WORKDIR}/coffee-shop-yaml/coffee-shop/service.yaml
+
+service=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/service.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/annotations"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$service" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/service.yaml
+service=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/service.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/namespace"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$service" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/service.yaml
+service=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/service.yaml --type=json --patch='[{"op": "remove", "path": "/spec/clusterIP"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$service" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/service.yaml
+service=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/service.yaml --type=json --patch='[{"op": "remove", "path": "/spec/clusterIPs"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$service" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/service.yaml
+service=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/service.yaml --type=json --patch='[{"op": "remove", "path": "/spec/internalTrafficPolicy"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$service" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/service.yaml
+service=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/service.yaml --type=json --patch='[{"op": "remove", "path": "/spec/ipFamilies"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$service" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/service.yaml
+service=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/service.yaml --type=json --patch='[{"op": "remove", "path": "/spec/ipFamilyPolicy"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$service" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/service.yaml
+
+oc get route coffee-shop -o yaml | oc neat > ${WORKDIR}/coffee-shop-yaml/coffee-shop/route.yaml
+
+route=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/route.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/annotations"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$route" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/route.yaml
+route=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/route.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/namespace"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$route" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/route.yaml
+route=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/route.yaml --type=json --patch='[{"op": "remove", "path": "/spec/host"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$route" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/route.yaml
+
+oc get secret coffee-shop -o yaml | oc neat > ${WORKDIR}/coffee-shop-yaml/coffee-shop/secret.yaml
+secret=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/secret.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/namespace"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$secret" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/secret.yaml
+
+oc get configmap coffee-shop -o yaml | oc neat > ${WORKDIR}/coffee-shop-yaml/coffee-shop/configmap.yaml
+configmap=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/configmap.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/namespace"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$configmap" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/configmap.yaml
+
+oc get is coffee-shop -o yaml | oc neat > ${WORKDIR}/coffee-shop-yaml/coffee-shop/imagestream.yaml
+imagestream=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/imagestream.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/annotations"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$imagestream" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/imagestream.yaml
+imagestream=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/imagestream.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/namespace"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$imagestream" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/imagestream.yaml
+imagestream=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/imagestream.yaml --type=json --patch='[{"op": "remove", "path": "/spec/tags"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$imagestream" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/imagestream.yaml
+
+oc get bc coffee-shop -o yaml | oc neat > ${WORKDIR}/coffee-shop-yaml/coffee-shop/buildconfig.yaml
+buildconfig=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/buildconfig.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/annotations"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$buildconfig" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/buildconfig.yaml
+buildconfig=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/buildconfig.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/namespace"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$buildconfig" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/buildconfig.yaml
+buildconfig=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop/buildconfig.yaml --type=json --patch='[{"op": "remove", "path": "/spec/triggers"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$buildconfig" > ${WORKDIR}/coffee-shop-yaml/coffee-shop/buildconfig.yaml
+
+
+oc get ksvc barista -o yaml | oc neat > ${WORKDIR}/coffee-shop-yaml/barista/knative_service.yaml
+knative_service=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/barista/knative_service.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/annotations"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$knative_service" > ${WORKDIR}/coffee-shop-yaml/barista/knative_service.yaml
+knative_service=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/barista/knative_service.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/namespace"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$knative_service" > ${WORKDIR}/coffee-shop-yaml/barista/knative_service.yaml
+knative_service=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/barista/knative_service.yaml --type=json --patch='[{"op": "remove", "path": "/spec/template/metadata/annotations"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$knative_service" > ${WORKDIR}/coffee-shop-yaml/barista/knative_service.yaml
+knative_service=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/barista/knative_service.yaml --type=json --patch='[{"op": "remove", "path": "/spec/template/metadata/creationTimestamp"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$knative_service" > ${WORKDIR}/coffee-shop-yaml/barista/knative_service.yaml
+knative_service=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/barista/knative_service.yaml --type=json --patch='[{"op": "remove", "path": "/spec/template/metadata/name"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$knative_service" > ${WORKDIR}/coffee-shop-yaml/barista/knative_service.yaml
+
+
+export barista_latest=$(podman search nexus-registry-nexus.${OCP_APPS_DOMAIN}/${MY_USER}-barista --format json | jq '.[-1].Name' | cut -d "/" -f "2,3" | tr -d '"')
+knative_service=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/barista/knative_service.yaml --type=json --patch="[{\"op\": \"replace\", \"path\": \"/spec/template/spec/containers/0/image\",\"value\": $barista_latest}]" --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$knative_service" > ${WORKDIR}/coffee-shop-yaml/barista/knative_service.yaml
+
+oc get is barista -o yaml | oc neat > ${WORKDIR}/coffee-shop-yaml/barista/imagestream.yaml
+imagestream=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/barista/imagestream.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/annotations"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$imagestream" > ${WORKDIR}/coffee-shop-yaml/barista/imagestream.yaml
+imagestream=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/barista/imagestream.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/namespace"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$imagestream" > ${WORKDIR}/coffee-shop-yaml/barista/imagestream.yaml
+imagestream=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/barista/imagestream.yaml --type=json --patch='[{"op": "remove", "path": "/spec/tags"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$imagestream" > ${WORKDIR}/coffee-shop-yaml/barista/imagestream.yaml
+
+oc get bc barista -o yaml | oc neat > ${WORKDIR}/coffee-shop-yaml/barista/buildconfig.yaml
+buildconfig=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/barista/buildconfig.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/annotations"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$buildconfig" > ${WORKDIR}/coffee-shop-yaml/barista/buildconfig.yaml
+buildconfig=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/barista/buildconfig.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/namespace"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$buildconfig" > ${WORKDIR}/coffee-shop-yaml/barista/buildconfig.yaml
+buildconfig=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/barista/buildconfig.yaml --type=json --patch='[{"op": "remove", "path": "/spec/triggers"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$buildconfig" > ${WORKDIR}/coffee-shop-yaml/barista/buildconfig.yaml
+
+oc get dc coffee-shop-database -o yaml | oc neat > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/annotations"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/labels/template"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/namespace"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml --type=json --patch='[{"op": "remove", "path": "/spec/template/metadata/annotations"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml --type=json --patch='[{"op": "remove", "path": "/spec/template/metadata/creationTimestamp"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml
+
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml --type=json --patch='[{"op": "replace", "path": "/apiVersion", "value": "apps/v1"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml --type=json --patch='[{"op": "replace", "path": "/kind", "value": "Deployment"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml --type=json --patch="[{\"op\": \"replace\", \"path\": \"/spec/selector\", \"value\": { \"matchLabels\":{\"name\":\"coffee-shop-database\"}}}]" --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml
+
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml --type=json --patch="[{\"op\": \"replace\", \"path\": \"/spec/template/spec/containers/0/image\",\"value\": "image-registry.openshift-image-registry.svc:5000/openshift/postgresql:10-el8"}]" --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml
+
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml --type=json --patch='[{"op": "remove", "path": "/spec/triggers"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml
+
+oc get service coffee-shop-database -o yaml | oc neat > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/service.yaml
+
+service=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/service.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/annotations"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$service" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/service.yaml
+service=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/service.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/labels/template"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$service" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/service.yaml
+service=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/service.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/namespace"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$service" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/service.yaml
+service=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/service.yaml --type=json --patch='[{"op": "remove", "path": "/spec/clusterIP"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$service" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/service.yaml
+service=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/service.yaml --type=json --patch='[{"op": "remove", "path": "/spec/clusterIPs"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$service" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/service.yaml
+service=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/service.yaml --type=json --patch='[{"op": "remove", "path": "/spec/internalTrafficPolicy"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$service" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/service.yaml
+service=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/service.yaml --type=json --patch='[{"op": "remove", "path": "/spec/ipFamilies"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$service" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/service.yaml
+service=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/service.yaml --type=json --patch='[{"op": "remove", "path": "/spec/ipFamilyPolicy"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$service" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/service.yaml
+
+
+oc get secret coffee-shop-database -o yaml | oc neat > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/secret.yaml
+secret=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/secret.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/annotations"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$secret" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/secret.yaml
+secret=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/secret.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/labels/template"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$secret" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/secret.yaml
+secret=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/secret.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/namespace"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$secret" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/secret.yaml
+
+oc get pvc coffee-shop-database -o yaml | oc neat > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/pvc.yaml
+pvc=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/pvc.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/annotations"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$pvc" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/pvc.yaml
+pvc=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/pvc.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/labels/template"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$pvc" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/pvc.yaml
+pvc=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/pvc.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/namespace"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$pvc" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/pvc.yaml
+pvc=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/pvc.yaml --type=json --patch='[{"op": "remove", "path": "/spec/volumeName"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$pvc" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/pvc.yaml
+pvc=$(oc patch --filename=${WORKDIR}/coffee-shop-yaml/coffee-shop-database/pvc.yaml --type=json --patch='[{"op": "remove", "path": "/spec/storageClassName"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$pvc" > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/pvc.yaml
+
+
+oc new-project ${MY_USER}-test-coffeeshop --display-name="Coffee Shop for ${MY_USER} (Testing)"
+
+oc apply -f ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/pvc.yaml
+oc apply -f ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/secret.yaml
+oc apply -f ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/service.yaml
+oc apply -f ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml
+
+oc apply -f ${WORKDIR}/coffee-shop-yaml/barista/knative_service.yaml
+oc apply -f ${WORKDIR}/coffee-shop-yaml/coffee-shop/secret.yaml
+oc apply -f ${WORKDIR}/coffee-shop-yaml/coffee-shop/service.yaml
+
+cp ${WORKDIR}/coffee-shop-yaml/coffee-shop/configmap.yaml ${WORKDIR}/coffee-shop-yaml/coffee-shop/configmap-test.yaml
+sed -i '' -e 's/-dev-/-test-/g' ${WORKDIR}/coffee-shop-yaml/coffee-shop/configmap-test.yaml
+
+oc apply -f ${WORKDIR}/coffee-shop-yaml/coffee-shop/configmap-test.yaml
+
+rm ${WORKDIR}/coffee-shop-yaml/coffee-shop/configmap-test.yaml
+
+oc apply -f ${WORKDIR}/coffee-shop-yaml/coffee-shop/deployment.yaml
+oc apply -f ${WORKDIR}/coffee-shop-yaml/coffee-shop/route.yaml
+
+curl "http://$(oc get route coffee-shop --template='{{ .spec.host }}')/health"
+
+oc delete project ${MY_USER}-test-coffeeshop
+
+kubeseal --scope cluster-wide --controller-namespace sealed-secrets --controller-name sealed-secrets-controller --format yaml \
+  < ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/secret.yaml \
+  > ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/sealed_secret.yaml
+
+kubeseal --scope cluster-wide --controller-namespace sealed-secrets --controller-name sealed-secrets-controller --format yaml \
+  < ${WORKDIR}/coffee-shop-yaml/coffee-shop/secret.yaml \
+  > ${WORKDIR}/coffee-shop-yaml/coffee-shop/sealed_secret.yaml
+
+oc new-project ${MY_USER}-test-coffeeshop --display-name="Coffee Shop for ${MY_USER} (Testing)"
+
+oc apply -f ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/pvc.yaml
+oc apply -f ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/sealed_secret.yaml
+oc apply -f ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/service.yaml
+oc apply -f ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml
+
+oc apply -f ${WORKDIR}/coffee-shop-yaml/barista/knative_service.yaml
+
+oc apply -f ${WORKDIR}/coffee-shop-yaml/coffee-shop/sealed_secret.yaml
+oc apply -f ${WORKDIR}/coffee-shop-yaml/coffee-shop/service.yaml
+
+cp ${WORKDIR}/coffee-shop-yaml/coffee-shop/configmap.yaml ${WORKDIR}/coffee-shop-yaml/coffee-shop/configmap-test.yaml
+sed -i '' -e 's/-dev-/-test-/g' ${WORKDIR}/coffee-shop-yaml/coffee-shop/configmap-test.yaml
+
+oc apply -f ${WORKDIR}/coffee-shop-yaml/coffee-shop/configmap-test.yaml
+
+rm ${WORKDIR}/coffee-shop-yaml/coffee-shop/configmap-test.yaml
+
+oc apply -f ${WORKDIR}/coffee-shop-yaml/coffee-shop/deployment.yaml
+oc apply -f ${WORKDIR}/coffee-shop-yaml/coffee-shop/route.yaml
+
+curl "http://$(oc get route coffee-shop --template='{{ .spec.host }}')/health"
+
+oc delete project ${MY_USER}-test-coffeeshop && oc project ${MY_USER}-dev-coffeeshop
+
+rm ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/secret.yaml
+rm ${WORKDIR}/coffee-shop-yaml/coffee-shop/secret.yaml
+
+// NOTE: Add this to the lab instructions
+
+curl -X POST "https://gitea.${OCP_APPS_DOMAIN}/api/v1/user/repos" \
+  -u "${MY_USER}:${MY_PASSWORD}" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d '{
+  "auto_init": false,
+  "default_branch": "main",
+  "name": "coffee-shop-yaml",
+  "private": true
+}'
+
+git -C ${WORKDIR}/coffee-shop-yaml init
+git -C ${WORKDIR}/coffee-shop-yaml add --all
+git -C ${WORKDIR}/coffee-shop-yaml commit -m "Initial Commit"
+git -C ${WORKDIR}/coffee-shop-yaml remote add origin "https://${MY_USER}:${MY_PASSWORD}@gitea.${OCP_APPS_DOMAIN}/${MY_USER}/coffee-shop-yaml.git"
+git -C ${WORKDIR}/coffee-shop-yaml push -u origin main
+
+-------------------------------------------------------------------------------
+06 Kustomize Lab
+-------------------------------------------------------------------------------
+
+mkdir -p ${WORKDIR}/coffee-shop-kustomize/coffee-shop/base
+mkdir -p ${WORKDIR}/coffee-shop-kustomize/coffee-shop/overlays/production
+mkdir -p ${WORKDIR}/coffee-shop-kustomize/coffee-shop/overlays/development
+
+cp ${WORKDIR}/coffee-shop-yaml/coffee-shop/sealed_secret.yaml ${WORKDIR}/coffee-shop-kustomize/coffee-shop/base
+cp ${WORKDIR}/coffee-shop-yaml/coffee-shop/deployment.yaml ${WORKDIR}/coffee-shop-kustomize/coffee-shop/base
+cp ${WORKDIR}/coffee-shop-yaml/coffee-shop/service.yaml ${WORKDIR}/coffee-shop-kustomize/coffee-shop/base
+cp ${WORKDIR}/coffee-shop-yaml/coffee-shop/route.yaml ${WORKDIR}/coffee-shop-kustomize/coffee-shop/base
+cp ${WORKDIR}/coffee-shop-yaml/coffee-shop/imagestream.yaml ${WORKDIR}/coffee-shop-kustomize/coffee-shop/overlays/development
+cp ${WORKDIR}/coffee-shop-yaml/coffee-shop/buildconfig.yaml ${WORKDIR}/coffee-shop-kustomize/coffee-shop/overlays/development
+
+service=$(oc patch --filename=${WORKDIR}/coffee-shop-kustomize/coffee-shop/base/service.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/labels/app"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$service" > ${WORKDIR}/coffee-shop-kustomize/coffee-shop/base/service.yaml
+service=$(oc patch --filename=${WORKDIR}/coffee-shop-kustomize/coffee-shop/base/service.yaml --type=json --patch='[{"op": "remove", "path": "/spec/selector"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$service" > ${WORKDIR}/coffee-shop-kustomize/coffee-shop/base/service.yaml
+
+route=$(oc patch --filename=${WORKDIR}/coffee-shop-kustomize/coffee-shop/base/route.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/labels/app"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$route" > ${WORKDIR}/coffee-shop-kustomize/coffee-shop/base/route.yaml
+
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-kustomize/coffee-shop/base/deployment.yaml --type=json --patch='[{"op": "remove", "path": "/metadata/labels/app"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-kustomize/coffee-shop/base/deployment.yaml
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-kustomize/coffee-shop/base/deployment.yaml --type=json --patch='[{"op": "remove", "path": "/spec/selector"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-kustomize/coffee-shop/base/deployment.yaml
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-kustomize/coffee-shop/base/deployment.yaml --type=json --patch='[{"op": "remove", "path": "/spec/template/metadata"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-kustomize/coffee-shop/base/deployment.yaml
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-kustomize/coffee-shop/base/deployment.yaml --type=json --patch='[{"op": "replace", "path": "/spec/template/spec/containers/0/image","value": "<PATCH_ME>"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-kustomize/coffee-shop/base/deployment.yaml
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-kustomize/coffee-shop/base/deployment.yaml --type=json --patch='[{"op": "remove", "path": "/spec/template/spec/containers/0/env"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-kustomize/coffee-shop/base/deployment.yaml
+deployment=$(oc patch --filename=${WORKDIR}/coffee-shop-kustomize/coffee-shop/base/deployment.yaml --type=json --patch='[{"op": "add", "path": "/spec/template/spec/containers/0/envFrom", "value": [{"configMapRef":{"name":"coffee-shop"}},{"secretRef":{"name":"coffee-shop"}}]}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$deployment" > ${WORKDIR}/coffee-shop-kustomize/coffee-shop/base/deployment.yaml
+
+$(cd ${WORKDIR}/coffee-shop-kustomize/coffee-shop/base && kustomize create --autodetect --labels app:coffee-shop)
+
+# kustomize build ${WORKDIR}/coffee-shop-kustomize/coffee-shop/base
+
+export coffee_shop_latest=$(oc get deploy coffee-shop -o jsonpath="{ .spec.template.spec.containers[0].image }" -n ${MY_USER}-dev-coffeeshop)
+
+cat << EOF >${WORKDIR}/coffee-shop-kustomize/coffee-shop/overlays/development/deployment-patches.yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coffee-shop
+spec:
+  template:
+    spec:
+      containers:
+      - name: coffee-shop
+        image: ${coffee_shop_latest}
+EOF
+
+echo "BARISTA_URL=http://barista.${MY_USER}-dev-coffeeshop.svc.cluster.local/processes" > ${WORKDIR}/coffee-shop-kustomize/coffee-shop/overlays/development/configmap.env
+
+cat << EOF >${WORKDIR}/coffee-shop-kustomize/coffee-shop/overlays/development/kustomization.yaml
+---
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+bases:
+- ../../base
+
+resources:
+- ./imagestream.yaml
+- ./buildconfig.yaml
+
+namespace: ${MY_USER}-dev-coffeeshop
+
+patches:
+- ./deployment-patches.yaml
+
+configMapGenerator:
+- name: coffee-shop
+  envs:
+  - ./configmap.env
+EOF
+
+# kustomize build ${WORKDIR}/coffee-shop-kustomize/coffee-shop/overlays/development
+
+export coffee_shop_latest=$(podman search nexus-registry-nexus.${OCP_APPS_DOMAIN}/${MY_USER}-coffee-shop --format json | jq '.[-1].Name' | cut -d "/" -f "2,3" | tr -d '"')
+
+cat << EOF >${WORKDIR}/coffee-shop-kustomize/coffee-shop/overlays/production/deployment-patches.yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coffee-shop
+spec:
+  template:
+    spec:
+      containers:
+      - name: coffee-shop
+        image: ${coffee_shop_latest}
+EOF
+
+echo "BARISTA_URL=http://barista.${MY_USER}-prod-coffeeshop.svc.cluster.local/processes" > ${WORKDIR}/coffee-shop-kustomize/coffee-shop/overlays/production/configmap.env
+
+cat << EOF >${WORKDIR}/coffee-shop-kustomize/coffee-shop/overlays/production/kustomization.yaml
+---
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+bases:
+- ../../base
+
+namespace: ${MY_USER}-prod-coffeeshop
+
+patches:
+- ./deployment-patches.yaml
+
+configMapGenerator:
+- name: coffee-shop
+  envs:
+  - ./configmap.env
+EOF
+
+# kustomize build ${WORKDIR}/coffee-shop-kustomize/coffee-shop/overlays/production
+
+mkdir -p ${WORKDIR}/coffee-shop-kustomize/barista/base
+mkdir -p ${WORKDIR}/coffee-shop-kustomize/barista/overlays/production
+mkdir -p ${WORKDIR}/coffee-shop-kustomize/barista/overlays/development
+
+cp ${WORKDIR}/coffee-shop-yaml/barista/knative_service.yaml ${WORKDIR}/coffee-shop-kustomize/barista/base
+cp ${WORKDIR}/coffee-shop-yaml/barista/imagestream.yaml ${WORKDIR}/coffee-shop-kustomize/barista/overlays/development
+cp ${WORKDIR}/coffee-shop-yaml/barista/buildconfig.yaml ${WORKDIR}/coffee-shop-kustomize/barista/overlays/development
+
+knative=$(oc patch --filename=${WORKDIR}/coffee-shop-kustomize/barista/base/knative_service.yaml --type=json --patch='[{"op": "replace", "path": "/spec/template/spec/containers/0/image","value": "<PATCH_ME>"}]' --local=true --dry-run=client -o yaml 2> /dev/null) && echo "$knative" > ${WORKDIR}/coffee-shop-kustomize/barista/base/knative_service.yaml
+
+$(cd ${WORKDIR}/coffee-shop-kustomize/barista/base && kustomize create --autodetect)
+
+# kustomize build ${WORKDIR}/coffee-shop-kustomize/barista/base
+
+export barista_latest=$(oc get ksvc barista -o jsonpath="{ .spec.template.spec.containers[0].image }" -n ${MY_USER}-dev-coffeeshop)
+
+cat << EOF >${WORKDIR}/coffee-shop-kustomize/barista/overlays/development/knative-service-patch.yaml
+---
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: barista
+spec:
+  template:
+    spec:
+      containers:
+      - name: user-container
+        image: ${barista_latest}
+EOF
+
+cat << EOF >${WORKDIR}/coffee-shop-kustomize/barista/overlays/development/kustomization.yaml
+---
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+bases:
+- ../../base
+
+resources:
+- ./imagestream.yaml
+- ./buildconfig.yaml
+
+namespace: ${MY_USER}-dev-coffeeshop
+
+patches:
+- ./knative-service-patch.yaml
+EOF
+
+# kustomize build ${WORKDIR}/coffee-shop-kustomize/barista/overlays/development
+
+export barista_latest=$(podman search nexus-registry-nexus.${OCP_APPS_DOMAIN}/${MY_USER}-barista --format json | jq '.[-1].Name' | cut -d "/" -f "2,3" | tr -d '"')
+
+cat << EOF >${WORKDIR}/coffee-shop-kustomize/barista/overlays/production/knative-service-patch.yaml
+---
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: barista
+spec:
+  template:
+    spec:
+      containers:
+      - name: user-container
+        image: ${barista_latest}
+EOF
+
+cat << EOF >${WORKDIR}/coffee-shop-kustomize/barista/overlays/production/kustomization.yaml
+---
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+bases:
+- ../../base
+
+namespace: ${MY_USER}-prod-coffeeshop
+
+patches:
+- ./knative-service-patch.yaml
+EOF
+
+# kustomize build ${WORKDIR}/coffee-shop-kustomize/barista/overlays/production
+
+curl -X POST "https://gitea.${OCP_APPS_DOMAIN}/api/v1/user/repos" \
+  -u "${MY_USER}:${MY_PASSWORD}" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d '{
+  "auto_init": false,
+  "default_branch": "main",
+  "name": "coffee-shop-kustomize",
+  "private": true
+}'
+
+git -C ${WORKDIR}/coffee-shop-kustomize init
+git -C ${WORKDIR}/coffee-shop-kustomize add --all
+git -C ${WORKDIR}/coffee-shop-kustomize commit -m "Initial Commit"
+git -C ${WORKDIR}/coffee-shop-kustomize remote add origin "https://${MY_USER}:${MY_PASSWORD}@gitea.${OCP_APPS_DOMAIN}/${MY_USER}/coffee-shop-kustomize.git
+git -C ${WORKDIR}/coffee-shop-kustomize push -u origin main
+
+
+oc new-project ${MY_USER}-test-coffeeshop --display-name="Coffee Shop for ${MY_USER} (Testing)"
+
+oc apply -f ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/pvc.yaml
+oc apply -f ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/sealed_secret.yaml
+oc apply -f ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/service.yaml
+oc apply -f ${WORKDIR}/coffee-shop-yaml/coffee-shop-database/deployment.yaml
+
+mkdir -p ${WORKDIR}/coffee-shop-kustomize/coffee-shop/overlays/test
+
+export coffee_shop_latest=$(podman search nexus-registry-nexus.${OCP_APPS_DOMAIN}/${MY_USER}-coffee-shop --format json | jq '.[-1].Name' | cut -d "/" -f "2,3" | tr -d '"')
+
+cat << EOF >${WORKDIR}/coffee-shop-kustomize/coffee-shop/overlays/test/deployment-patches.yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coffee-shop
+spec:
+  template:
+    spec:
+      containers:
+      - name: coffee-shop
+        image: ${coffee_shop_latest}
+EOF
+
+echo "BARISTA_URL=http://barista.${MY_USER}-test-coffeeshop.svc.cluster.local/processes" > ${WORKDIR}/coffee-shop-kustomize/coffee-shop/overlays/test/configmap.env
+
+cat << EOF >${WORKDIR}/coffee-shop-kustomize/coffee-shop/overlays/test/kustomization.yaml
+---
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+bases:
+- ../../base
+
+namespace: ${MY_USER}-test-coffeeshop
+
+patches:
+- ./deployment-patches.yaml
+
+configMapGenerator:
+- name: coffee-shop
+  envs:
+  - ./configmap.env
+EOF
+
+mkdir -p ${WORKDIR}/coffee-shop-kustomize/barista/overlays/test
+
+export barista_latest=$(podman search nexus-registry-nexus.${OCP_APPS_DOMAIN}/${MY_USER}-barista --format json | jq '.[-1].Name' | cut -d "/" -f "2,3" | tr -d '"')
+
+cat << EOF >${WORKDIR}/coffee-shop-kustomize/barista/overlays/test/knative-service-patch.yaml
+---
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: barista
+spec:
+  template:
+    spec:
+      containers:
+      - name: user-container
+        image: ${barista_latest}
+EOF
+
+cat << EOF >${WORKDIR}/coffee-shop-kustomize/barista/overlays/test/kustomization.yaml
+---
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+bases:
+- ../../base
+
+namespace: ${MY_USER}-test-coffeeshop
+
+patches:
+- ./knative-service-patch.yaml
+EOF
+
+kustomize build ${WORKDIR}/coffee-shop-kustomize/barista/overlays/test | oc apply -f -
+
+kustomize build ${WORKDIR}/coffee-shop-kustomize/coffee-shop/overlays/test | oc apply -f -
+
+oc delete project ${MY_USER}-test-coffeeshop
+
+git -C ${WORKDIR}/coffee-shop-kustomize add ${WORKDIR}/coffee-shop-kustomize/coffee-shop/overlays/test/*
+git -C ${WORKDIR}/coffee-shop-kustomize add ${WORKDIR}/coffee-shop-kustomize/barista/overlays/test/*
+git -C ${WORKDIR}/coffee-shop-kustomize commit -m "Added test overlay"
+git -C ${WORKDIR}/coffee-shop-kustomize push
+
+
+-------------------------------------------------------------------------------
+07 Helm Lab
+-------------------------------------------------------------------------------
+
+helm create ${WORKDIR}/coffee-shop-postgresql
+
+ansible localhost -m lineinfile -a "path=${WORKDIR}/coffee-shop-postgresql/Chart.yaml regexp='^name:' line='name: ${MY_USER}-coffee-shop-postgresql'"
+ansible localhost -m lineinfile -a "path=${WORKDIR}/coffee-shop-postgresql/Chart.yaml regexp='^description:' line='description: A PostgreSQL database for use in the Coffee Shop Microservices application'"
+ansible localhost -m lineinfile -a "path=${WORKDIR}/coffee-shop-postgresql/Chart.yaml regexp='^version:' line='version: 1.0.0'"
+ansible localhost -m lineinfile -a "path=${WORKDIR}/coffee-shop-postgresql/Chart.yaml regexp='^appVersion:' line='appVersion: \"10\"'"
+
+ansible localhost -m lineinfile -a "path=${WORKDIR}/coffee-shop-postgresql/values.yaml regexp='^(\s\s)(repository:)' backrefs=yes line='\1repository: image-registry.openshift-image-registry.svc:5000/openshift/postgresql'"
+ansible localhost -m lineinfile -a "path=${WORKDIR}/coffee-shop-postgresql/values.yaml regexp='^(\s\s)(tag:)' backrefs=yes line='\1tag: \"10-el8\"'"
+ansible localhost -m replace -a "path=${WORKDIR}/coffee-shop-postgresql/values.yaml regexp='^autoscaling:((\n[^\S\r\n])+(.)*)*' replace=''"
+ansible localhost -m replace -a "path=${WORKDIR}/coffee-shop-postgresql/values.yaml regexp='ingress:((\n[^\S\r\n])+(.)*)*' replace=''"
+ansible localhost -m replace -a "path=${WORKDIR}/coffee-shop-postgresql/values.yaml regexp='service:((\n[^\S\r\n])+(.)*)*' replace='service:\n  name: postgresql\n  type: ClusterIP\n  port: 5432\n  targetPort: 5432\n  protocol: TCP\n'"
+ansible localhost -m replace -a "path=${WORKDIR}/coffee-shop-postgresql/values.yaml regexp='resources:\s{}((\n[^\S\r\n])+(.)*)*' replace='resources:\n  requests:\n    memory: 256Mi\n    cpu: 100m\n  limits:\n    memory: 512Mi\n    cpu: 200m\n'"
+ansible localhost -m blockinfile -a "path=${WORKDIR}/coffee-shop-postgresql/values.yaml block='pvc:\n  size: 1Gi\n  accessModes:\n  - ReadWriteOnce\n' marker='# {mark} PVC'"
+ansible localhost -m blockinfile -a "path=${WORKDIR}/coffee-shop-postgresql/values.yaml block='credentials:\n  database: \"\"\n  username: \"\"\n  password: \"\"\n' marker='# {mark} DATABASE CREDENTIALS'"
+ansible localhost -m lineinfile -a "path=${WORKDIR}/coffee-shop-postgresql/values.yaml search_string='openshiftApplicationName' line='openshiftApplicationName: postgresql'"
+
+rm ${WORKDIR}/coffee-shop-postgresql/templates/hpa.yaml
+rm ${WORKDIR}/coffee-shop-postgresql/templates/ingress.yaml
+rm ${WORKDIR}/coffee-shop-postgresql/templates/NOTES.txt
+rm -rf ${WORKDIR}/coffee-shop-postgresql/templates/tests
+
+ansible localhost -m lineinfile -a "path=${WORKDIR}/coffee-shop-postgresql/templates/service.yaml regexp='^(\s+)(targetPort:)' backrefs=yes line='\1targetPort: {{ '{{' }} .Values.service.targetPort {{ '}}' }}'"
+ansible localhost -m lineinfile -a "path=${WORKDIR}/coffee-shop-postgresql/templates/service.yaml regexp='^(\s+)(protocol:)' backrefs=yes line='\1protocol: {{ '{{' }} .Values.service.protocol {{ '}}' }}'"
+ansible localhost -m lineinfile -a "path=${WORKDIR}/coffee-shop-postgresql/templates/service.yaml regexp='^(\s+)(name:)' backrefs=yes line='\1name: {{ '{{' }} .Values.service.name {{ '}}' }}'"
+
+cat << EOF >${WORKDIR}/coffee-shop-postgresql/templates/pvc.yaml
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "coffee-shop-postgresql.fullname" . }}
+  labels:
+    {{- include "coffee-shop-postgresql.labels" . | nindent 4 }}
+spec:
+  accessModes:
+  {{- toYaml .Values.pvc.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.pvc.size }}
+EOF
+
+cat << EOF >${WORKDIR}/coffee-shop-postgresql/templates/secret.yaml
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "coffee-shop-postgresql.fullname" . }}
+  labels:
+    {{- include "coffee-shop-postgresql.labels" . | nindent 4 }}
+stringData:
+  POSTGRESQL_DATABASE: {{ required "credentials.database is required" .Values.credentials.database }}
+  POSTGRESQL_USER: {{ required "credentials.username is required" .Values.credentials.username }}
+  POSTGRESQL_PASSWORD: {{ required "credentials.password is required" .Values.credentials.password }}
+type: Opaque
+EOF
+
+cat << EOF >${WORKDIR}/coffee-shop-postgresql/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "coffee-shop-postgresql.fullname" . }}
+  labels:
+    app.kubernetes.io/component: postgresql-persistent
+    app.openshift.io/runtime: postgresql
+    app.kubernetes.io/part-of: {{ .Values.openshiftApplicationName }}
+    {{- include "coffee-shop-postgresql.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "coffee-shop-postgresql.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "coffee-shop-postgresql.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "coffee-shop-postgresql.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+      - name: {{ .Chart.Name }}
+        envFrom:
+        - secretRef:
+            name: {{ include "coffee-shop-postgresql.fullname" . }}
+        securityContext:
+          {{- toYaml .Values.securityContext | nindent 12 }}
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        ports:
+          - name: {{ .Values.service.name }}
+            containerPort: {{ .Values.service.port }}
+            protocol: {{ .Values.service.protocol }}
+        livenessProbe:
+          exec:
+            command:
+            - /usr/libexec/check-container
+        readinessProbe:
+          exec:
+            command:
+            - /usr/libexec/check-container
+        resources:
+          {{- toYaml .Values.resources | nindent 12 }}
+        volumeMounts:
+        - mountPath: /var/lib/pgsql/data
+          name: coffee-shop-postgresql-data
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+      - name: coffee-shop-postgresql-data
+        persistentVolumeClaim:
+          claimName: {{ include "coffee-shop-postgresql.fullname" . }}
+EOF
+
+
+oc new-project ${MY_USER}-database-test
+
+helm install coffee-shop-postgresql ${WORKDIR}/coffee-shop-postgresql --dry-run --set-string credentials.database=coffee,credentials.username=coffee,credentials.password=coffee,openshiftApplicationName=coffee-shop,fullnameOverride=coffee-shop-database
+
+helm install coffee-shop-postgresql ${WORKDIR}/coffee-shop-postgresql --set-string credentials.database=coffee,credentials.username=coffee,credentials.password=coffee,openshiftApplicationName=coffee-shop,fullnameOverride=coffee-shop-database
+
+oc logs -f $(oc get pod -l app.kubernetes.io/name=${MY_USER}-coffee-shop-postgresql -o name)
+
+open $(oc whoami --show-console)/topology/ns/${MY_USER}-database-test
+
+helm uninstall coffee-shop-postgresql
+
+helm package ${WORKDIR}/coffee-shop-postgresql --destination ${WORKDIR}/coffee-shop-postgresql/charts
+
+curl -v "https://nexus-nexus.${OCP_APPS_DOMAIN}/repository/helm/" \
+  --user admin:redhat \
+  --upload-file ${WORKDIR}/coffee-shop-postgresql/charts/${MY_USER}-coffee-shop-postgresql-1.0.0.tgz
+
+helm repo add nexus --username admin --password redhat "https://nexus-nexus.${OCP_APPS_DOMAIN}/repository/helm"
+
+helm repo update
+helm search repo nexus
+
+helm install coffee-shop-postgresql nexus/${MY_USER}-coffee-shop-postgresql --set credentials.database=coffee,credentials.username=coffee,credentials.password=coffee,openshiftApplicationName=coffee-shop,fullnameOverride=coffee-shop-database
+
+oc logs -f $(oc get pod -l app.kubernetes.io/name=${MY_USER}-coffee-shop-postgresql -o name)
+open $(oc whoami --show-console)/topology/ns/${MY_USER}-database-test
+
+helm uninstall coffee-shop-postgresql -n ${OCP_USER}-database-test
+oc delete project ${OCP_USER}-database-test
+
+echo "charts/" > ${WORKDIR}/coffee-shop-postgresql/.gitignore
+
+curl -X POST "https://gitea.${OCP_APPS_DOMAIN}/api/v1/user/repos" \
+  -u "${MY_USER}:${MY_PASSWORD}" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d '{
+  "auto_init": false,
+  "default_branch": "main",
+  "name": "coffee-shop-postgresql",
+  "private": true
+}'
+
+git -C ${WORKDIR}/coffee-shop-postgresql init
+git -C ${WORKDIR}/coffee-shop-postgresql add --all
+git -C ${WORKDIR}/coffee-shop-postgresql commit -m "Initial Commit"
+git -C ${WORKDIR}/coffee-shop-postgresql remote add origin "https://${MY_USER}:${MY_PASSWORD}@gitea.${OCP_APPS_DOMAIN}/${MY_USER}/coffee-shop-postgresql.git"
+git -C ${WORKDIR}/coffee-shop-postgresql push -u origin main
+
+
+-------------------------------------------------------------------------------
+08 ArgoCD Lab
+-------------------------------------------------------------------------------
+
+oc delete project ${MY_USER}-prod-coffeeshop
+
+oc new-project ${MY_USER}-prod-coffeeshop --display-name="Coffee Shop for ${MY_USER} (Production managed by Argo CD)"
+
+oc new-project ${MY_USER}-argocd --display-name="Argo CD for ${MY_USER}"
+
+cat << EOF >${WORKDIR}/argocd.yaml
+---
+apiVersion: argoproj.io/v1alpha1
+kind: ArgoCD
+metadata:
+  name: argocd
+spec:
+  server:
+    insecure: true
+    route:
+      enabled: true
+      tls:
+        insecureEdgeTerminationPolicy: Redirect
+        termination: edge
+EOF
+
+oc apply -f ${WORKDIR}/argocd.yaml
+
+oc patch secret argocd-cluster --patch '{"stringData": {"admin.password": "redhat"}}'
+
+argocd login --grpc-web --username admin --password redhat $(oc get route argocd-server --template='{{ .spec.host }}')
+
+oc policy add-role-to-user \
+   edit \
+   system:serviceaccount:${MY_USER}-argocd:argocd-argocd-application-controller \
+   --rolebinding-name=argocd-edit \
+   -n ${MY_USER}-prod-coffeeshop
+
+cat << EOF >${WORKDIR}/argocd-managed.yaml
+apiVersion: pfe.opentlc.com/v1
+kind: ArgoCDManaged
+metadata:
+  name: ${MY_USER}-prod-coffeeshop
+  namespace: ${MY_USER}-prod-coffeeshop
+spec:
+  argocdNamespace: ${MY_USER}-argocd
+EOF
+
+oc create -f ${WORKDIR}/argocd-managed.yaml
+
+oc get project ${MY_USER}-prod-coffeeshop -o yaml | oc neat | grep argocd
+
+oc get route
+
+open "https://$(oc get route argocd-server --template='{{ .spec.host }}')"
+
+argocd repo add "https://gitea.${OCP_APPS_DOMAIN}/${MY_USER}/coffee-shop-kustomize.git" --name coffee-shop-kustomize --username ${MY_USER} --password ${MY_PASSWORD}
+argocd repo add "https://nexus-nexus.${OCP_APPS_DOMAIN}/repository/helm" --type helm --name nexus-helm
+
+argocd proj create coffee-shop \
+  --dest "https://kubernetes.default.svc,${MY_USER}-prod-coffeeshop" \
+  --src "https://gitea.${OCP_APPS_DOMAIN}/${MY_USER}/coffee-shop-kustomize.git" \
+  --src "https://nexus-nexus.${OCP_APPS_DOMAIN}/repository/helm" \
+  --description "Argo CD project for Coffee Shop Application (${MY_USER})"
+
+
+argocd app create coffee-shop-database \
+  --project coffee-shop \
+  --repo "https://nexus-nexus.${OCP_APPS_DOMAIN}/repository/helm" \
+  --helm-chart ${MY_USER}-coffee-shop-postgresql \
+  --revision 1.0.0 \
+  --dest-namespace ${MY_USER}-prod-coffeeshop \
+  --dest-server https://kubernetes.default.svc \
+  --helm-set-string fullnameOverride=coffee-shop-database \
+  --helm-set-string openshiftApplicationName=coffee-shop \
+  --helm-set-string credentials.database=coffeeshop \
+  --helm-set-string credentials.username=coffee \
+  --helm-set-string credentials.password=coffee
+
+argocd app sync coffee-shop-database
+
+argocd app create barista \
+  --project coffee-shop \
+  --repo "https://gitea.${OCP_APPS_DOMAIN}/${MY_USER}/coffee-shop-kustomize.git" \
+  --path barista/overlays/production \
+  --dest-namespace ${MY_USER}-prod-coffeeshop \
+  --dest-server https://kubernetes.default.svc
+
+argocd app sync barista
+
+argocd app create coffee-shop \
+  --project coffee-shop \
+  --repo "https://gitea.${OCP_APPS_DOMAIN}/${MY_USER}/coffee-shop-kustomize.git" \
+  --path coffee-shop/overlays/production \
+  --dest-namespace ${MY_USER}-prod-coffeeshop \
+  --dest-server https://kubernetes.default.svc
+
+argocd app sync coffee-shop
+
+
+curl -I "http://$(oc get route coffee-shop --template='{{ .spec.host }}' -n ${MY_USER}-prod-coffeeshop)/index.html"
+open "http://$(oc get route coffee-shop --template='{{ .spec.host }}' -n ${MY_USER}-prod-coffeeshop)/index.html"
+
+
+mkdir ${WORKDIR}/coffee-shop-argocd
+
+oc get application coffee-shop-database -o yaml -n ${MY_USER}-argocd | oc neat > ${WORKDIR}/coffee-shop-argocd/coffee-shop-database.yaml
+oc get application coffee-shop -o yaml -n ${MY_USER}-argocd | oc neat > ${WORKDIR}/coffee-shop-argocd/coffee-shop.yaml
+oc get application barista -o yaml -n ${MY_USER}-argocd | oc neat > ${WORKDIR}/coffee-shop-argocd/barista.yaml
+
+
+$(cd ${WORKDIR}/coffee-shop-argocd && kustomize create --autodetect)
+
+kustomize build ${WORKDIR}/coffee-shop-argocd
+
+curl -X POST "https://gitea.${OCP_APPS_DOMAIN}/api/v1/user/repos" \
+  -u "${MY_USER}:${MY_PASSWORD}" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d '{
+  "auto_init": false,
+  "default_branch": "main",
+  "name": "coffee-shop-argocd",
+  "private": true
+}'
+
+git -C ${WORKDIR}/coffee-shop-argocd init
+git -C ${WORKDIR}/coffee-shop-argocd add --all
+git -C ${WORKDIR}/coffee-shop-argocd commit -m "Initial Commit"
+git -C ${WORKDIR}/coffee-shop-argocd remote add origin "https://${MY_USER}:${MY_PASSWORD}@gitea.${OCP_APPS_DOMAIN}/${MY_USER}/coffee-shop-argocd.git"
+git -C ${WORKDIR}/coffee-shop-argocd push -u origin main
+
+argocd repo add "https://gitea.${OCP_APPS_DOMAIN}/${MY_USER}/coffee-shop-argocd.git" --name coffee-shop-argocd --username ${MY_USER} --password ${MY_PASSWORD}
+
+argocd proj add-source coffee-shop "https://gitea.${OCP_APPS_DOMAIN}/${MY_USER}/coffee-shop-argocd.git"
+
+argocd proj add-destination coffee-shop https://kubernetes.default.svc ${MY_USER}-argocd
+
+argocd app delete coffee-shop --yes
+argocd app delete barista --yes
+argocd app delete coffee-shop-database --yes
+
+argocd app create coffee-shop-app-of-apps \
+  --project coffee-shop \
+  --repo "https://gitea.${OCP_APPS_DOMAIN}/${MY_USER}/coffee-shop-argocd.git" \
+  --path . \
+  --dest-namespace ${MY_USER}-argocd \
+  --dest-server https://kubernetes.default.svc
+
+argocd app sync coffee-shop-app-of-apps
+
+argocd app set coffee-shop-app-of-apps --sync-policy automated --self-heal
+
+cat << EOF >${WORKDIR}/coffee-shop-argocd/syncpolicy-patch.yaml
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: does-not-matter
+spec:
+  syncPolicy:
+    automated:
+      selfHeal: true
+EOF
+
+ansible localhost -m blockinfile -a "path=${WORKDIR}/coffee-shop-argocd/kustomization.yaml block='patches:\n- path: syncpolicy-patch.yaml\n  target:\n    group: argoproj.io\n    version: v1alpha1\n    kind: Application\n' marker='# {mark} PATCH'"
+
+kustomize build ${WORKDIR}/coffee-shop-argocd
+
+git -C ${WORKDIR}/coffee-shop-argocd add kustomization.yaml syncpolicy-patch.yaml
+git -C ${WORKDIR}/coffee-shop-argocd commit -m "Turned on Autosync for all application"
+git -C ${WORKDIR}/coffee-shop-argocd push
+
+
+curl -I "http://$(oc get route coffee-shop --template='{{ .spec.host }}' -n ${MY_USER}-prod-coffeeshop)/index.html"
+open "http://$(oc get route coffee-shop --template='{{ .spec.host }}' -n ${MY_USER}-prod-coffeeshop)/index.html"
+
+
+-------------------------------------------------------------------------------
+09 OpenShift Pipelines Lab
+-------------------------------------------------------------------------------
+
+TODO

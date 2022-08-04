@@ -1,0 +1,301 @@
+---
+- debug:
+    msg: "LAB 06 KUSTOMIZE"
+
+- name: create coffee-shop kustomize directory structure
+  ansible.builtin.file:
+    path: "{{ workdir }}/coffee-shop-kustomize/coffee-shop/{{ item }}"
+    state: directory
+  loop:
+    - base
+    - overlays/development
+    - overlays/production
+
+- name: copy manifests to coffee-shop kustomize directory structure
+  ansible.builtin.copy:
+    remote_src: true
+    src: "{{ workdir }}/coffee-shop-yaml/coffee-shop/{{ item[0] }}"
+    dest: "{{ workdir }}/coffee-shop-kustomize/coffee-shop/{{ item[1] }}"
+  loop:
+    - ["sealed_secret.yaml", "base"]
+    - ["deployment.yaml", "base"]
+    - ["service.yaml", "base"]
+    - ["route.yaml", "base"]
+    - ["imagestream.yaml", "overlays/development"]
+    - ["buildconfig.yaml", "overlays/development"]
+
+- name: patch coffee-shop service.yaml kustomize base file
+  ansible.builtin.shell: >-
+    service=$(oc patch --filename={{ workdir }}/coffee-shop-kustomize/coffee-shop/base/service.yaml --type=json --patch='[{"op": "remove", "path": {{ item }}}]' --local=true --dry-run=client -o yaml)
+    && echo "$service" > {{ workdir }}/coffee-shop-kustomize/coffee-shop/base/service.yaml
+  loop:
+    - /metadata/labels/app
+    - /spec/selector
+  register: this
+  failed_when: this.rc != 0 and 'missing value' not in this.stderr
+
+- name: patch coffee-shop service.yaml kustomize base file
+  ansible.builtin.shell: >-
+    service=$(oc patch --filename={{ workdir }}/coffee-shop-kustomize/coffee-shop/base/service.yaml --type=json --patch='[{"op": "remove", "path": {{ item }}}]' --local=true --dry-run=client -o yaml)
+    && echo "$service" > {{ workdir }}/coffee-shop-kustomize/coffee-shop/base/service.yaml
+  loop:
+    - /metadata/labels/app
+    - /spec/selector
+  register: this
+  failed_when: this.rc != 0 and 'missing value' not in this.stderr
+
+- name: patch coffee-shop route.yaml kustomize base file
+  ansible.builtin.shell: >-
+    route=$(oc patch --filename={{ workdir }}/coffee-shop-kustomize/coffee-shop/base/route.yaml --type=json --patch='[{"op": "remove", "path": {{ item }}}]' --local=true --dry-run=client -o yaml)
+    && echo "$route" > {{ workdir }}/coffee-shop-kustomize/coffee-shop/base/route.yaml
+  loop:
+    - /metadata/labels/app
+  register: this
+  failed_when: this.rc != 0 and 'missing value' not in this.stderr
+
+- name: patch (remove fields from) coffee-shop deployment.yaml kustomize base file
+  ansible.builtin.shell: >-
+    deployment=$(oc patch --filename={{ workdir }}/coffee-shop-kustomize/coffee-shop/base/deployment.yaml --type=json --patch='[{"op": "remove", "path": {{ item }}}]' --local=true --dry-run=client -o yaml)
+    && echo "$deployment" > {{ workdir }}/coffee-shop-kustomize/coffee-shop/base/deployment.yaml
+  loop:
+    - /metadata/labels/app
+    - /spec/selector
+    - /spec/template/metadata
+    - /spec/template/spec/containers/0/env
+  register: this
+  failed_when: this.rc != 0 and 'missing value' not in this.stderr
+
+- name: patch (replace image from) coffee-shop deployment.yaml kustomize base file
+  ansible.builtin.shell: >-
+    deployment=$(oc patch --filename={{ workdir }}/coffee-shop-kustomize/coffee-shop/base/deployment.yaml --type=json --patch='[{"op": "replace", "path": "/spec/template/spec/containers/0/image","value": "<PATCH_ME>"}]' --local=true --dry-run=client -o yaml)
+    && echo "$deployment" > {{ workdir }}/coffee-shop-kustomize/coffee-shop/base/deployment.yaml
+
+- name: patch (add envFrom from) coffee-shop deployment.yaml kustomize base file
+  ansible.builtin.shell: >-
+    deployment=$(oc patch --filename={{ workdir }}/coffee-shop-kustomize/coffee-shop/base/deployment.yaml --type=json --patch='[{"op": "add", "path": "/spec/template/spec/containers/0/envFrom", "value": [{"configMapRef":{"name":"coffee-shop"}},{"secretRef":{"name":"coffee-shop"}}]}]' --local=true --dry-run=client -o yaml)
+    && echo "$deployment" > {{ workdir }}/coffee-shop-kustomize/coffee-shop/base/deployment.yaml
+
+- block:
+    - name: remove coffee-shop kustomization.yaml base file
+      ansible.builtin.file:
+        path: "{{ workdir }}/coffee-shop-kustomize/coffee-shop/base/kustomization.yaml"
+        state: absent
+    - name: create coffee-shop kustomization.yaml base file
+      ansible.builtin.shell: |-
+        $(cd {{ workdir }}/coffee-shop-kustomize/coffee-shop/base && kustomize create --autodetect --labels app:coffee-shop)
+
+- name: get deployment coffee-shop
+  kubernetes.core.k8s_info:
+    kind: Deployment
+    name: coffee-shop
+    namespace: "{{ dev }}"
+  register: coffeeshop_deploy
+
+- name: create coffee-shop deployment-patches.yaml development file
+  vars:
+    coffee_shop_latest: "{{ coffeeshop_deploy.resources[0].spec.template.spec.containers[0].image }}"
+  ansible.builtin.template:
+    src: 06_kustomize_lab/deployment-patches.yaml.j2
+    dest: "{{ workdir }}/coffee-shop-kustomize/coffee-shop/overlays/development/deployment-patches.yaml"
+
+- name: create coffee-shop configmap.env development file
+  vars:
+    ocp_project: "{{ dev }}"
+  ansible.builtin.template:
+    src: 06_kustomize_lab/configmap.env.j2
+    dest: "{{ workdir }}/coffee-shop-kustomize/coffee-shop/overlays/development/configmap.env"
+
+- name: create coffee-shop kustomization.yaml development file
+  vars:
+    ocp_project: "{{ dev }}"
+  ansible.builtin.template:
+    src: 06_kustomize_lab/coffee-kustomization.yaml.j2
+    dest: "{{ workdir }}/coffee-shop-kustomize/coffee-shop/overlays/development/kustomization.yaml"
+
+- name: podman search coffee-shop image latest
+  ansible.builtin.shell: |-
+    podman search nexus-registry-nexus.{{ ocp_apps_domain }}/{{ ocp_user }}-coffee-shop --format "{{ '{{' }} .Name {{ '}}' }}" | tail -n 1 | cut -d "/" -f "2,3" | tr -d '"'
+  register: coffee_latest_rs
+  until: coffee_latest_rs.rc == 0 and coffee_latest_rs.stdout | length > 0
+  retries: 18
+  delay: 10
+
+- name: create coffee-shop deployment-patches.yaml production file
+  vars:
+    coffee_shop_latest: "{{ coffee_latest_rs.stdout }}"
+  ansible.builtin.template:
+    src: 06_kustomize_lab/deployment-patches.yaml.j2
+    dest: "{{ workdir }}/coffee-shop-kustomize/coffee-shop/overlays/production/deployment-patches.yaml"
+
+- name: create coffee-shop configmap.env production file
+  vars:
+    ocp_project: "{{ prod }}"
+  ansible.builtin.template:
+    src: 06_kustomize_lab/configmap.env.j2
+    dest: "{{ workdir }}/coffee-shop-kustomize/coffee-shop/overlays/production/configmap.env"
+
+- name: create coffee-shop kustomization.yaml production file
+  vars:
+    ocp_project: "{{ prod }}"
+  ansible.builtin.template:
+    src: 06_kustomize_lab/coffee-kustomization.yaml.j2
+    dest: "{{ workdir }}/coffee-shop-kustomize/coffee-shop/overlays/production/kustomization.yaml"
+
+- name: create barista kustomize directory structure
+  ansible.builtin.file:
+    path: "{{ workdir }}/coffee-shop-kustomize/barista/{{ item }}"
+    state: directory
+  loop:
+    - base
+    - overlays/development
+    - overlays/production
+
+- name: copy manifests to barista kustomize directory structure
+  copy:
+    remote_src: true
+    src: "{{ workdir }}/coffee-shop-yaml/barista/{{ item[0] }}"
+    dest: "{{ workdir }}/coffee-shop-kustomize/barista/{{ item[1] }}"
+  loop:
+    - ["knative_service.yaml", "base"]
+    - ["imagestream.yaml", "overlays/development"]
+    - ["buildconfig.yaml", "overlays/development"]
+
+- name: patch barista knative_service.yaml kustomize base file
+  ansible.builtin.shell: >-
+    knative=$(oc patch --filename={{ workdir }}/coffee-shop-kustomize/barista/base/knative_service.yaml --type=json --patch='[{"op": "replace", "path": "/spec/template/spec/containers/0/image","value": "<PATCH_ME>"}]' --local=true --dry-run=client -o yaml)
+    && echo "$knative" > {{ workdir }}/coffee-shop-kustomize/barista/base/knative_service.yaml
+
+- block:
+    - name: remove barista kustomization.yaml base file
+      ansible.builtin.file:
+        path: "{{ workdir }}/coffee-shop-kustomize/barista/base/kustomization.yaml"
+        state: absent
+    - name: create barista kustomization.yaml base file
+      ansible.builtin.shell: |-
+        $(cd {{ workdir }}/coffee-shop-kustomize/barista/base && kustomize create --autodetect)
+
+- name: get knative service barista
+  kubernetes.core.k8s_info:
+    api_version: serving.knative.dev/v1
+    kind: Service
+    name: barista
+    namespace: "{{ dev }}"
+  register: barista_kservice
+
+- name: create barista knative-service-patches.yaml development file
+  vars:
+    barista_latest: "{{ barista_kservice.resources[0].spec.template.spec.containers[0].image }}"
+  ansible.builtin.template:
+    src: 06_kustomize_lab/knative-service-patch.yaml.j2
+    dest: "{{ workdir }}/coffee-shop-kustomize/barista/overlays/development/knative-service-patch.yaml"
+
+- name: create barista kustomization.yaml development file
+  vars:
+    ocp_project: "{{ dev }}"
+  ansible.builtin.template:
+    src: 06_kustomize_lab/barista-kustomization.yaml.j2
+    dest: "{{ workdir }}/coffee-shop-kustomize/barista/overlays/development/kustomization.yaml"
+
+- name: podman search barista image latest
+  ansible.builtin.shell: |-
+    podman search nexus-registry-nexus.{{ ocp_apps_domain }}/{{ ocp_user }}-barista --format "{{ '{{' }} .Name {{ '}}' }}" | tail -n 1 | cut -d "/" -f "2,3" | tr -d '"'
+  register: barista_latest_rs
+  until: barista_latest_rs.rc == 0 and barista_latest_rs.stdout | length > 0
+  retries: 6
+  delay: 10
+
+- name: create barista knative-service-patches.yaml production file
+  vars:
+    barista_latest: "{{ barista_latest_rs.stdout }}"
+  ansible.builtin.template:
+    src: 06_kustomize_lab/knative-service-patch.yaml.j2
+    dest: "{{ workdir }}/coffee-shop-kustomize/barista/overlays/production/knative-service-patch.yaml"
+
+- name: create barista kustomization.yaml production file
+  vars:
+    ocp_project: "{{ prod }}"
+  ansible.builtin.template:
+    src: 06_kustomize_lab/barista-kustomization.yaml.j2
+    dest: "{{ workdir }}/coffee-shop-kustomize/barista/overlays/production/kustomization.yaml"
+
+- import_tasks: ./100_create_git_repo_push.yml
+  vars:
+    repo_name: coffee-shop-kustomize
+
+- import_tasks: ./100_create_project_namespace.yml
+  vars:
+    ocp_project: "{{ test }}"
+    ocp_project_description: Coffee Shop for {{ ocp_user }} (Testing)
+
+- name: apply coffee-shop database resources to {{ test }}
+  ansible.builtin.shell: |-
+    oc apply -f {{ workdir }}/coffee-shop-yaml/{{ item }} --overwrite -n {{ test }}
+  loop:
+    - coffee-shop-database/pvc.yaml
+    - coffee-shop-database/sealed_secret.yaml
+    - coffee-shop-database/service.yaml
+    - coffee-shop-database/deployment.yaml
+
+- name: create coffee-shop kustomize overlay test
+  ansible.builtin.file:
+    path: "{{ workdir }}/coffee-shop-kustomize/coffee-shop/overlays/test"
+    state: directory
+
+- name: create coffee-shop deployment-patches.yaml test file
+  vars:
+    coffee_shop_latest: "{{ coffee_latest_rs.stdout }}"
+  ansible.builtin.template:
+    src: 06_kustomize_lab/deployment-patches.yaml.j2
+    dest: "{{ workdir }}/coffee-shop-kustomize/coffee-shop/overlays/test/deployment-patches.yaml"
+
+- name: create coffee-shop configmap.env test file
+  vars:
+    ocp_project: "{{ test }}"
+  ansible.builtin.template:
+    src: 06_kustomize_lab/configmap.env.j2
+    dest: "{{ workdir }}/coffee-shop-kustomize/coffee-shop/overlays/test/configmap.env"
+
+- name: create coffee-shop kustomization.yaml test file
+  vars:
+    ocp_project: "{{ test }}"
+  ansible.builtin.template:
+    src: 06_kustomize_lab/coffee-kustomization.yaml.j2
+    dest: "{{ workdir }}/coffee-shop-kustomize/coffee-shop/overlays/test/kustomization.yaml"
+
+- name: create barista kustomize overlay test
+  ansible.builtin.file:
+    path: "{{ workdir }}/coffee-shop-kustomize/barista/overlays/test"
+    state: directory
+
+- name: create barista knative-service-patches.yaml test file
+  vars:
+    barista_latest: "{{ barista_latest_rs.stdout }}"
+  ansible.builtin.template:
+    src: 06_kustomize_lab/knative-service-patch.yaml.j2
+    dest: "{{ workdir }}/coffee-shop-kustomize/barista/overlays/test/knative-service-patch.yaml"
+
+- name: create barista kustomization.yaml test file
+  vars:
+    ocp_project: "{{ test }}"
+  ansible.builtin.template:
+    src: 06_kustomize_lab/barista-kustomization.yaml.j2
+    dest: "{{ workdir }}/coffee-shop-kustomize/barista/overlays/test/kustomization.yaml"
+
+- name: apply coffee-shop resources to {{ test }}
+  ansible.builtin.shell: |-
+    set -e
+    kustomize build {{ workdir }}/coffee-shop-kustomize/barista/overlays/test | oc apply --overwrite -n {{ test }} -f -
+    kustomize build {{ workdir }}/coffee-shop-kustomize/coffee-shop/overlays/test | oc apply --overwrite -n {{ test }} -f -
+
+- import_tasks: ./100_test_coffeeshop.yml
+
+- name: push coffee-shop-kustomize test manifests to gitea repository
+  ansible.builtin.shell: |-
+    set -e
+    git -C {{ workdir }}/coffee-shop-kustomize add {{ workdir }}/coffee-shop-kustomize/coffee-shop/overlays/test/*
+    git -C {{ workdir }}/coffee-shop-kustomize add {{ workdir }}/coffee-shop-kustomize/barista/overlays/test/*
+    git -C {{ workdir }}/coffee-shop-kustomize commit -m "Add test overlay"  || true
+    git -C {{ workdir }}/coffee-shop-kustomize push
+
+- debug:
+    msg: "LAB 06 KUSTOMIZE - COMPLETED"

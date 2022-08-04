@@ -1,0 +1,12 @@
+---
+workdir: "{{ ansible_env.HOME }}/redhat/appdev-{{ guid }}-{{ ocp_user }}"
+gitea_url: https://{{ ocp_user }}:{{ ocp_password }}@gitea.{{ ocp_apps_domain }}/{{ ocp_user }}
+ocp_project_dev: "{{ ocp_user }}-dev-coffeeshop"
+ocp_project_prod: "{{ ocp_user }}-prod-coffeeshop"
+dev: "{{ ocp_project_dev }}"
+prod: "{{ ocp_project_prod }}"
+test: "{{ ocp_user }}-test-coffeeshop"
+jenkins: "{{ ocp_user }}-jenkins"
+argocd: "{{ ocp_user }}-argocd"
+test_database: "{{ ocp_user }}-database-test"
+prompt: false

@@ -1,0 +1,295 @@
+---
+- debug:
+    msg: "LAB 08 ARGOCD"
+
+- import_tasks: ./100_create_project_namespace.yml
+  vars:
+    ocp_project: "{{ prod }}"
+    ocp_project_description: Coffee Shop for {{ ocp_user }} (Production managed by Argo CD)
+
+- name: create project {{ argocd }}
+  ansible.builtin.shell: |-
+    oc new-project {{ argocd }} --display-name="Argo CD for {{ ocp_user }}"
+  register: this
+  failed_when: this.rc != 0 and 'AlreadyExists' not in this.stderr
+
+- name: create argocd.yaml manifest
+  ansible.builtin.template:
+    src: 08_argocd_lab/argocd.yaml.j2
+    dest: "{{ workdir }}/argocd.yaml"
+
+- name: apply argocd.yaml manifest to {{ argocd }}
+  ansible.builtin.shell: |-
+    oc apply -f {{ workdir }}/argocd.yaml --overwrite -n {{ argocd }}
+
+- name: wait deployment argocd-server
+  kubernetes.core.k8s_info:
+    kind: Deployment
+    name: argocd-server
+    namespace: "{{ argocd }}"
+    wait: yes
+    wait_timeout: 120
+
+- name: patch secret argocd-cluster change admin.password to redhat
+  ansible.builtin.shell: |-
+    oc patch secret argocd-cluster --patch '{"stringData": {"admin.password": "redhat"}}' -n {{ argocd }}
+
+- name: get route argocd
+  kubernetes.core.k8s_info:
+    api_version: route.openshift.io/v1
+    kind: Route
+    name: argocd-server
+    namespace: "{{ argocd }}"
+  register: argocd_route
+
+- name: argocd login with user admin
+  ansible.builtin.shell: |-
+    argocd login --grpc-web --username admin --password redhat {{ argocd_route.resources[0].spec.host }}
+
+- name: add policy edit to argocd in {{ prod }} project
+  ansible.builtin.shell: |-
+    oc policy add-role-to-user edit system:serviceaccount:{{ argocd }}:argocd-argocd-application-controller --rolebinding-name=argocd-edit -n {{ prod }}
+
+- name: create argocd-managed.yaml manifest
+  ansible.builtin.template:
+    src: 08_argocd_lab/argocd-managed.yaml.j2
+    dest: "{{ workdir }}/argocd-managed.yaml"
+
+- name: apply argocd-managed.yaml manifest
+  ansible.builtin.shell: |-
+    oc apply -f {{ workdir }}/argocd-managed.yaml --overwrite
+
+- debug:
+    msg:
+      - Explore ArgoCD in your browser.
+      - Log in as 'admin' with password 'redhat'.
+      - https://{{ argocd_route.resources[0].spec.host }}
+
+- name: add argocd repositories
+  ansible.builtin.shell: |-
+    set -e
+    argocd repo add https://gitea.{{ ocp_apps_domain }}/{{ ocp_user }}/coffee-shop-kustomize.git --name coffee-shop-kustomize --username {{ ocp_user }} --password {{ ocp_password }}
+    argocd repo add https://nexus-nexus.{{ ocp_apps_domain }}/repository/helm --type helm --name nexus-helm
+
+- name: create argocd project
+  ansible.builtin.shell: >-
+    argocd proj create coffee-shop
+    --dest https://kubernetes.default.svc,{{ prod }}
+    --src https://gitea.{{ ocp_apps_domain }}/{{ ocp_user }}/coffee-shop-kustomize.git
+    --src https://nexus-nexus.{{ ocp_apps_domain }}/repository/helm
+    --description "Argo CD project for Coffee Shop Application ({{ ocp_user }})"
+    --upsert
+
+- name: create argocd app coffee-shop-database
+  ansible.builtin.shell: >-
+    argocd app create coffee-shop-database
+    --project coffee-shop
+    --repo https://nexus-nexus.{{ ocp_apps_domain }}/repository/helm
+    --helm-chart {{ ocp_user }}-coffee-shop-postgresql
+    --revision 1.0.0
+    --dest-namespace {{ prod }}
+    --dest-server https://kubernetes.default.svc
+    --helm-set-string fullnameOverride=coffee-shop-database
+    --helm-set-string openshiftApplicationName=coffee-shop
+    --helm-set-string credentials.database=coffeeshop
+    --helm-set-string credentials.username=coffee
+    --helm-set-string credentials.password=coffee
+    --upsert
+
+- name: sync argocd app coffee-shop-database
+  ansible.builtin.shell: >-
+    argocd app wait coffee-shop-database --operation
+    && argocd app sync coffee-shop-database --retry-limit 3
+
+- name: create argocd app barista
+  ansible.builtin.shell: >-
+    argocd app create barista
+    --project coffee-shop
+    --repo https://gitea.{{ ocp_apps_domain }}/{{ ocp_user }}/coffee-shop-kustomize.git
+    --path barista/overlays/production
+    --dest-namespace {{ prod }}
+    --dest-server https://kubernetes.default.svc
+    --upsert
+
+- name: sync argocd app barista
+  ansible.builtin.shell: >-
+    argocd app wait barista --operation
+    && argocd app sync barista --retry-limit 3
+
+- name: create argocd app coffee-shop
+  ansible.builtin.shell: >-
+    argocd app create coffee-shop
+    --project coffee-shop
+    --repo https://gitea.{{ ocp_apps_domain }}/{{ ocp_user }}/coffee-shop-kustomize.git
+    --path coffee-shop/overlays/production
+    --dest-namespace {{ prod }}
+    --dest-server https://kubernetes.default.svc
+    --upsert
+
+- name: sync argocd app coffee-shop
+  ansible.builtin.shell: >-
+    argocd app wait coffee-shop --operation
+    && argocd app sync coffee-shop --retry-limit 3
+
+- name: wait deployment coffee-shop
+  kubernetes.core.k8s_info:
+    kind: Deployment
+    name: coffee-shop
+    namespace: "{{ prod }}"
+    wait: yes
+    wait_timeout: 180
+
+- name: get route coffee-shop
+  kubernetes.core.k8s_info:
+    api_version: route.openshift.io/v1
+    kind: Route
+    name: coffee-shop
+    namespace: "{{ prod }}"
+  register: coffeeshop_route
+
+- name: test route coffee-shop health check
+  ansible.builtin.uri:
+    url: http://{{ coffeeshop_route.resources[0].spec.host }}/health
+    return_content: yes
+  register: this
+  until: this.status == 200 and 'UP' in this.content
+  retries: 3
+  delay: 5
+
+- debug:
+    msg:
+      - Explore the coffee-shop application in your browser.
+      - http://{{ coffeeshop_route.resources[0].spec.host }}/index.html
+
+- name: prompt coffee-shop testing
+  ansible.builtin.pause:
+    prompt: "Continue to change to app of apps deployment"
+  when: prompt | default(false) | bool
+
+- name: create barista kustomize directory structure
+  ansible.builtin.file:
+    path: "{{ workdir }}/coffee-shop-argocd"
+    state: directory
+
+- name: create argocd manifests
+  ansible.builtin.shell: |-
+    set -e
+    oc get application coffee-shop-database -o yaml -n {{ argocd }} | oc neat > {{ workdir }}/coffee-shop-argocd/coffee-shop-database.yaml
+    oc get application coffee-shop -o yaml -n {{ argocd }} | oc neat > {{ workdir }}/coffee-shop-argocd/coffee-shop.yaml
+    oc get application barista -o yaml -n {{ argocd }} | oc neat > {{ workdir }}/coffee-shop-argocd/barista.yaml
+
+- block:
+    - name: remove kustomization argocd files
+      ansible.builtin.file:
+        path: "{{ workdir }}/coffee-shop-argocd/{{ item }}"
+        state: absent
+      loop:
+        - kustomization.yaml
+        - syncpolicy-patch.yaml
+    - name: create kustomization.yaml argocd file
+      ansible.builtin.shell: |-
+        $(cd {{ workdir }}/coffee-shop-argocd && kustomize create --autodetect)
+
+- import_tasks: ./100_create_git_repo_push.yml
+  vars:
+    repo_name: coffee-shop-argocd
+
+- name: configure argocd app of apps repository
+  ansible.builtin.shell: |-
+    set -e
+    argocd repo add https://gitea.{{ ocp_apps_domain }}/{{ ocp_user }}/coffee-shop-argocd.git --name coffee-shop-argocd --username {{ ocp_user }} --password {{ ocp_password }}
+    argocd proj add-source coffee-shop https://gitea.{{ ocp_apps_domain }}/{{ ocp_user }}/coffee-shop-argocd.git
+    argocd proj add-destination coffee-shop https://kubernetes.default.svc {{ argocd }}
+
+- name: delete argocd apps managed by app-of-apps
+  ansible.builtin.shell: |-
+    argocd app delete {{ item }} --yes
+  loop:
+    - coffee-shop
+    - barista
+    - coffee-shop-database
+
+- name: create argocd app coffee-shop-app-of-apps
+  ansible.builtin.shell: >-
+    argocd app create coffee-shop-app-of-apps
+    --project coffee-shop
+    --repo https://gitea.{{ ocp_apps_domain }}/{{ ocp_user }}/coffee-shop-argocd.git
+    --path .
+    --dest-namespace {{ argocd }}
+    --dest-server https://kubernetes.default.svc
+    --upsert
+
+- name: sync argocd app coffee-shop-app-of-apps
+  ansible.builtin.shell: >-
+    argocd app wait coffee-shop-app-of-apps --operation
+    && argocd app sync coffee-shop-app-of-apps --retry-limit 3
+
+- name: set argocd automatic sync app coffee-shop-app-of-apps
+  ansible.builtin.shell: |-
+    argocd app set coffee-shop-app-of-apps --sync-policy automated --self-heal
+
+- name: create syncpolicy-patch.yaml argocd file
+  ansible.builtin.template:
+    src: 08_argocd_lab/syncpolicy-patch.yaml.j2
+    dest: "{{ workdir }}/coffee-shop-argocd/syncpolicy-patch.yaml"
+
+- name: patch values.yaml helm coffee-shop-postgresql
+  ansible.builtin.blockinfile:
+    path: "{{ workdir }}/coffee-shop-argocd/kustomization.yaml"
+    block: |
+      patches:
+      - path: syncpolicy-patch.yaml
+        target:
+          group: argoproj.io
+          version: v1alpha1
+          kind: Application
+    marker: "# {mark} PATCH"
+
+- name: add changes to gitea coffee-shop-argocd
+  ansible.builtin.shell: |-
+    set -e
+    git -C {{ workdir }}/coffee-shop-argocd add kustomization.yaml syncpolicy-patch.yaml
+    git -C {{ workdir }}/coffee-shop-argocd commit -m "Turned on Autosync for all applications" || true
+    git -C {{ workdir }}/coffee-shop-argocd push
+
+- name: sync argocd app coffee-shop-app-of-apps (force sync / auto sync is enabled)
+  ansible.builtin.shell: >-
+    argocd app wait coffee-shop-app-of-apps --operation
+    && argocd app sync coffee-shop-app-of-apps --retry-limit 3
+  register: this
+  until: this.rc == 0
+  retries: 3
+  delay: 10
+
+- name: wait deployment coffee-shop
+  kubernetes.core.k8s_info:
+    kind: Deployment
+    name: coffee-shop
+    namespace: "{{ prod }}"
+    wait: yes
+    wait_timeout: 180
+
+- name: get route coffee-shop
+  kubernetes.core.k8s_info:
+    api_version: route.openshift.io/v1
+    kind: Route
+    name: coffee-shop
+    namespace: "{{ prod }}"
+  register: coffeeshop_route
+
+- name: test route coffee-shop health check
+  ansible.builtin.uri:
+    url: http://{{ coffeeshop_route.resources[0].spec.host }}/health
+    return_content: yes
+  register: this
+  until: this.status == 200 and 'UP' in this.content
+  retries: 3
+  delay: 5
+
+- debug:
+    msg:
+      - Explore the coffee-shop application in your browser.
+      - http://{{ coffeeshop_route.resources[0].spec.host }}/index.html
+
+- debug:
+    msg: "LAB 08 ARGOCD - COMPLETED"

@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+bases:
+- ../../base
+
+{% if 'dev' in ocp_project %}
+resources:
+- ./imagestream.yaml
+- ./buildconfig.yaml
+{% endif %}
+
+namespace: {{ ocp_project }}
+
+patches:
+- ./knative-service-patch.yaml

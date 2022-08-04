@@ -1,0 +1,23 @@
+---
+- name: delete project {{ ocp_project }}
+  ansible.builtin.shell: |-
+    oc delete project {{ ocp_project }}
+  failed_when: false
+
+- name: wait delete project {{ ocp_project }}
+  ansible.builtin.shell: |-
+    oc get project {{ ocp_project }} 2>/dev/null | wc -l
+  register: this
+  until: this.stdout | trim == '0'
+  retries: 12
+  delay: 10
+
+# Workaround pause because logged in user doesn't know about 'Terminating' namespaces
+# Try implemeting until loop in create project
+- name: pause for delete project {{ ocp_project }}
+  ansible.builtin.pause:
+    seconds: 180
+
+- name: create project {{ ocp_project }}
+  ansible.builtin.shell: |-
+    oc new-project {{ ocp_project }} --display-name="{{ ocp_project_description | default('') }}"

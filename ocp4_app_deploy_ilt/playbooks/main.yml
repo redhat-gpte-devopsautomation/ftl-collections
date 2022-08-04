@@ -1,0 +1,56 @@
+---
+- name: set facts for ocp4_advanced_application_deployment
+  hosts: "{{ target | default('localhost') }}"
+  gather_facts: true
+  tags: always
+  tasks:
+    - name: look up vars from host environment
+      set_fact:
+        ocp_user: "{{ lookup('env','OCP_USER') | default(ocp_user, true) | mandatory }}"
+        ocp_password: "{{ lookup('env','OCP_PASSWORD') | default(ocp_password, true) | mandatory }}"
+        ocp_apps_domain: "{{ lookup('env','OCP_APPS_DOMAIN') | default(ocp_apps_domain, true) | mandatory }}"
+        ocp_api: "{{ lookup('env','OCP_API') | default(ocp_api, true) | mandatory }}"
+        guid: "{{ lookup('env','GUID') | default(guid, true) | mandatory }}"
+
+- name: solve labs ocp4_advanced_application_deployment
+  hosts: "{{ target | default('localhost') }}"
+  gather_facts: false
+  tags: solve_lab_all
+  tasks:
+    - import_tasks: ./tasks/01_environment_setup_linux.yml
+      when: ansible_facts['system'] == "Linux"
+      tags: solve_lab_01
+    - import_tasks: ./tasks/01_environment_setup.yml
+      tags: solve_lab_01
+    - import_tasks: ./tasks/02_kubernetes_patterns.yml
+      tags: solve_lab_02
+    - import_tasks: ./tasks/03_serverless_adv_builds.yml
+      tags: solve_lab_03
+    - import_tasks: ./tasks/04_jenkins_pipelines_lab.yml
+      tags: solve_lab_04
+    - import_tasks: ./tasks/05_gitops_lab.yml
+      tags: solve_lab_05
+    - import_tasks: ./tasks/06_kustomize_lab.yml
+      tags: solve_lab_06
+    - import_tasks: ./tasks/07_helm_lab.yml
+      tags: solve_lab_07
+    - import_tasks: ./tasks/08_argocd_lab.yml
+      tags: solve_lab_08
+
+- name: grade labs ocp4_advanced_application_deployment
+  hosts: "{{ target | default('localhost') }}"
+  gather_facts: false
+  tags: grade_lab_all
+  tasks:
+    - debug:
+        msg: "NOT IMPLEMENTED"
+      tags: grade_lab_01
+
+- name: reset labs ocp4_advanced_application_deployment
+  hosts: "{{ target | default('localhost') }}"
+  gather_facts: false
+  tags: reset_lab_all
+  tasks:
+    - debug:
+        msg: "NOT IMPLEMENTED"
+      tags: reset_lab_01

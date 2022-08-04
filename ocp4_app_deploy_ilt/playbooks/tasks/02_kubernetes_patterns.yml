@@ -1,0 +1,162 @@
+---
+- debug:
+    msg: "LAB 02 KUBERNETES PATTERNS"
+
+- name: create project {{ dev }}
+  ansible.builtin.shell: |-
+    oc new-project {{ dev }} --display-name="Coffee Shop for {{ ocp_user }} (Development)"
+  register: this
+  failed_when: this.rc != 0 and 'AlreadyExists' not in this.stderr
+
+- import_tasks: ./100_create_project_namespace.yml
+  vars:
+    ocp_project: "{{ prod }}"
+    ocp_project_description: Coffee Shop for {{ ocp_user }} (Production)
+
+- name: select project {{ dev }}
+  ansible.builtin.shell: |-
+    oc project {{ dev }}
+
+- name: create new-app postgresql-persistent database
+  ansible.builtin.shell: |-
+    set -e
+    oc new-app postgresql-persistent --param DATABASE_SERVICE_NAME=coffee-shop-database --param POSTGRESQL_USER=coffee --param POSTGRESQL_PASSWORD=coffee --param POSTGRESQL_DATABASE=coffeeshop --dry-run --output yaml | oc apply -n {{ dev }} --overwrite -f -
+    oc label dc coffee-shop-database app.kubernetes.io/part-of=coffee-shop app.openshift.io/runtime=postgresql --overwrite -n {{ dev }}
+
+- name: create secret gitea
+  ansible.builtin.shell: |-
+    oc create secret generic gitea-secret --from-literal=username={{ ocp_user }} --from-literal=password={{ ocp_password }} --dry-run=client --output yaml | oc apply -n {{ dev }} --overwrite -f -
+
+- name: delete knative service barista
+  ansible.builtin.shell: |-
+    kn service delete barista -n {{ dev }}
+  register: this
+  failed_when: this.rc != 0 and 'not found' not in this.stderr
+
+- name: create new-app barista
+  ansible.builtin.shell: |-
+    set -e
+    oc delete all -l app=barista -n {{ dev }}
+    oc new-app openshift/ubi8-openjdk-11:1.3~{{ gitea_url }}/coffee-shop-source.git \
+      --name=barista \
+      --context-dir=barista \
+      --source-secret=gitea-secret \
+      --build-env=MAVEN_MIRROR_URL=http://nexus.nexus.svc:8081/repository/maven-all-public/ \
+      --labels=app.kubernetes.io/part-of=coffee-shop,app.openshift.io/runtime=quarkus \
+      --dry-run --output yaml | oc apply -n {{ dev }} --overwrite -f -
+
+- name: wait deployment barista
+  kubernetes.core.k8s_info:
+    kind: Deployment
+    name: barista
+    namespace: "{{ dev }}"
+    wait: yes
+    wait_timeout: 180
+
+- import_tasks: ./100_test_barista.yml
+
+- name: create new-app coffee-shop
+  ansible.builtin.shell: |-
+    set -e
+    oc delete all -l app=coffee-shop -n {{ dev }}
+    oc new-app openshift/ubi8-openjdk-11:1.3~{{ gitea_url }}/coffee-shop-source.git \
+      --name=coffee-shop \
+      --context-dir=coffee-shop \
+      --source-secret=gitea-secret \
+      --build-env=MAVEN_MIRROR_URL=http://nexus.nexus.svc:8081/repository/maven-all-public/ \
+      --labels=app.kubernetes.io/part-of=coffee-shop,app.openshift.io/runtime=quarkus \
+      --dry-run --output yaml | oc apply -n {{ dev }} --overwrite -f -
+
+- name: create secret coffee-shop
+  ansible.builtin.shell: >-
+    oc create secret generic coffee-shop
+    --from-literal=quarkus.datasource.db-kind=postgresql
+    --from-literal=quarkus.datasource.jdbc.url=jdbc:postgresql://coffee-shop-database:5432/coffeeshop
+    --from-literal=quarkus.datasource.username=coffee
+    --from-literal=quarkus.datasource.password=coffee
+    --dry-run --output yaml | oc apply -n {{ dev }} --overwrite -f -
+
+- name: create configmap coffee-shop
+  ansible.builtin.shell: |-
+    oc create configmap coffee-shop --from-literal=BARISTA_URL=http://barista:8080/processes --dry-run --output yaml | oc apply -n {{ dev }} --overwrite -f -
+
+- name: set deployment env coffee-shop from configmap and secret
+  ansible.builtin.shell: |-
+    set -e
+    oc set env deploy coffee-shop --from=secret/coffee-shop --overwrite -n {{ dev }}
+    oc set env deploy coffee-shop --from=configmap/coffee-shop --overwrite -n {{ dev }}
+
+- name: annotate deployment coffee-shop
+  ansible.builtin.shell: |-
+    oc annotate deploy coffee-shop app.openshift.io/connects-to='["coffee-shop-database",{"apiVersion":"apps.openshift.io/v1","kind":"DeploymentConfig","name":"coffee-shop-database"},{"apiVersion":"apps/v1","kind":"Deployment","name":"barista"}]' --overwrite -n {{ dev }}
+
+- name: wait deployment coffee-shop
+  kubernetes.core.k8s_info:
+    kind: Deployment
+    name: coffee-shop
+    namespace: "{{ dev }}"
+    wait: yes
+    wait_timeout: 180
+
+- name: expose route coffee-shop
+  ansible.builtin.shell: |-
+    oc expose service coffee-shop --dry-run --output yaml -n {{ dev }} | oc apply --overwrite -n {{ dev }} -f -
+
+- name: get route coffee-shop
+  kubernetes.core.k8s_info:
+    api_version: route.openshift.io/v1
+    kind: Route
+    name: coffee-shop
+    namespace: "{{ dev }}"
+  register: coffeeshop_route
+
+- name: test route coffee-shop health check
+  ansible.builtin.uri:
+    url: http://{{ coffeeshop_route.resources[0].spec.host }}/health
+    return_content: yes
+  register: this
+  until: this.status == 200 and 'UP' in this.content
+  retries: 3
+  delay: 5
+
+- name: test route coffee-shop types endpoint
+  vars:
+    info: "{{ lookup('dict', item) }}"
+  ansible.builtin.uri:
+    url: http://{{ coffeeshop_route.resources[0].spec.host }}/types
+    return_content: yes
+  register: this
+  failed_when: this.json | length != 3
+
+- name: test route coffee-shop orders endpoint
+  vars:
+    info: "{{ lookup('dict', item) }}"
+  ansible.builtin.uri:
+    url: http://{{ coffeeshop_route.resources[0].spec.host }}/types
+    status_code: 200
+
+- name: set health check probes to barista
+  ansible.builtin.shell: |-
+    set -e
+    oc set probe deploy/barista --readiness --get-url=http://:8080/health -n {{ dev }}
+    oc set probe deploy/barista --liveness --get-url=http://:8080/health -n {{ dev }}
+
+- name: set health check probes to coffee-shop
+  ansible.builtin.shell: |-
+    set -e
+    oc set probe deploy/coffee-shop --readiness --get-url=http://:8080/health -n {{ dev }}
+    oc set probe deploy/coffee-shop --liveness --get-url=http://:8080/health -n {{ dev }}
+
+- name: set resource requests to barista and coffee-shop
+  ansible.builtin.shell: |-
+    set -e
+    oc set resources deploy/barista --requests=cpu=100m,memory=256Mi -n {{ dev }}
+    oc set resources deploy/coffee-shop --requests=cpu=100m,memory=384Mi -n {{ dev }}
+
+- debug:
+    msg:
+      - Explore the coffee-shop application in your browser.
+      - http://{{ coffeeshop_route.resources[0].spec.host }}/index.html
+
+- debug:
+    msg: "LAB 02 KUBERNETES PATTERNS - COMPLETED"

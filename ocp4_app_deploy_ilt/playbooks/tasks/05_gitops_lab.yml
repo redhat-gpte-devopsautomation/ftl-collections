@@ -1,0 +1,319 @@
+---
+- debug:
+    msg: "LAB 05 GITOPS"
+
+- name: create coffee-shop-yaml directory structure file
+  ansible.builtin.file:
+    path: "{{ workdir }}/coffee-shop-yaml/{{ item }}"
+    state: directory
+  loop:
+    - coffee-shop
+    - coffee-shop-database
+    - barista
+
+- name: select project {{ dev }}
+  ansible.builtin.shell: |-
+    oc project {{ dev }}
+
+- name: create coffee-shop deployment.yaml file
+  ansible.builtin.shell: |-
+    oc get deployment coffee-shop -o yaml -n {{ dev }} | oc neat > {{ workdir }}/coffee-shop-yaml/coffee-shop/deployment.yaml
+
+- name: patch coffee-shop deployment.yaml file
+  ansible.builtin.shell: >-
+    deployment=$(oc patch --filename={{ workdir }}/coffee-shop-yaml/coffee-shop/deployment.yaml --type=json --patch='[{"op": "remove", "path": {{ item }}}]' --local=true --dry-run=client -o yaml)
+    && echo "$deployment" > {{ workdir }}/coffee-shop-yaml/coffee-shop/deployment.yaml
+  loop:
+    - /metadata/annotations/deployment.kubernetes.io~1revision
+    - /metadata/annotations/image.openshift.io~1triggers
+    - /metadata/annotations/openshift.io~1generated-by
+    - /metadata/namespace
+    - /spec/template/metadata/annotations
+    - /spec/template/metadata/creationTimestamp
+  register: this
+  failed_when: this.rc != 0 and 'missing value' not in this.stderr
+
+- name: annotate coffee-shop deployment.yaml file
+  ansible.builtin.shell: >-
+    deployment=$(oc annotate --filename={{ workdir }}/coffee-shop-yaml/coffee-shop/deployment.yaml app.openshift.io/connects-to='["coffee-shop-database",{"apiVersion":"apps/v1","kind":"Deployment","name":"coffee-shop-database"},{"apiVersion":"serving.knative.dev/v1","kind":"Service","name":"barista"}]' --overwrite --local=true --dry-run=client -o yaml)
+    && echo "$deployment" > {{ workdir }}/coffee-shop-yaml/coffee-shop/deployment.yaml
+
+- name: podman search coffee-shop image latest
+  ansible.builtin.shell: |-
+    podman search nexus-registry-nexus.{{ ocp_apps_domain }}/{{ ocp_user }}-coffee-shop --format "{{ '{{' }} .Name {{ '}}' }}" | tail -n 1 | cut -d "/" -f "2,3" | tr -d '"'
+  register: coffee_latest_rs
+  until: coffee_latest_rs.rc == 0 and coffee_latest_rs.stdout | length > 0
+  retries: 18
+  delay: 10
+
+- name: patch coffee-shop image deployment.yaml file
+  ansible.builtin.shell: >-
+    deployment=$(oc patch --filename={{ workdir }}/coffee-shop-yaml/coffee-shop/deployment.yaml --type=json --patch="[{\"op\": \"replace\", \"path\": \"/spec/template/spec/containers/0/image\",\"value\": {{ coffee_latest_rs.stdout }}}]" --local=true --dry-run=client -o yaml)
+    && echo "$deployment" > {{ workdir }}/coffee-shop-yaml/coffee-shop/deployment.yaml
+
+- name: create coffee-shop service.yaml file
+  ansible.builtin.shell: |-
+    oc get service coffee-shop -o yaml -n {{ dev }} | oc neat > {{ workdir }}/coffee-shop-yaml/coffee-shop/service.yaml
+
+- name: patch coffee-shop service.yaml file
+  ansible.builtin.shell: >-
+    service=$(oc patch --filename={{ workdir }}/coffee-shop-yaml/coffee-shop/service.yaml --type=json --patch='[{"op": "remove", "path": {{ item }}}]' --local=true --dry-run=client -o yaml)
+    && echo "$service" > {{ workdir }}/coffee-shop-yaml/coffee-shop/service.yaml
+  loop:
+    - /metadata/annotations
+    - /metadata/namespace
+    - /spec/clusterIP
+    - /spec/clusterIPs
+    - /spec/internalTrafficPolicy
+    - /spec/ipFamilies
+    - /spec/ipFamilyPolicy
+  register: this
+  failed_when: this.rc != 0 and 'missing value' not in this.stderr
+
+- name: create coffee-shop route.yaml file
+  ansible.builtin.shell: |-
+    oc get route coffee-shop -o yaml -n {{ dev }} | oc neat > {{ workdir }}/coffee-shop-yaml/coffee-shop/route.yaml
+
+- name: patch coffee-shop route.yaml file
+  ansible.builtin.shell: >-
+    route=$(oc patch --filename={{ workdir }}/coffee-shop-yaml/coffee-shop/route.yaml --type=json --patch='[{"op": "remove", "path": {{ item }}}]' --local=true --dry-run=client -o yaml)
+    && echo "$route" > {{ workdir }}/coffee-shop-yaml/coffee-shop/route.yaml
+  loop:
+    - /metadata/annotations
+    - /metadata/namespace
+    - /spec/host
+  register: this
+  failed_when: this.rc != 0 and 'missing value' not in this.stderr
+
+- name: create coffee-shop secret.yaml file
+  ansible.builtin.shell: |-
+    oc get secret coffee-shop -o yaml -n {{ dev }} | oc neat > {{ workdir }}/coffee-shop-yaml/coffee-shop/secret.yaml
+
+- name: patch coffee-shop secret.yaml file
+  ansible.builtin.shell: >-
+    secret=$(oc patch --filename={{ workdir }}/coffee-shop-yaml/coffee-shop/secret.yaml --type=json --patch='[{"op": "remove", "path": {{ item }}}]' --local=true --dry-run=client -o yaml)
+    && echo "$secret" > {{ workdir }}/coffee-shop-yaml/coffee-shop/secret.yaml
+  loop:
+    - /metadata/namespace
+  register: this
+  failed_when: this.rc != 0 and 'missing value' not in this.stderr
+
+- name: create coffee-shop configmap.yaml file
+  ansible.builtin.shell: |-
+    oc get configmap coffee-shop -o yaml -n {{ dev }} | oc neat > {{ workdir }}/coffee-shop-yaml/coffee-shop/configmap.yaml
+
+- name: patch coffee-shop configmap.yaml file
+  ansible.builtin.shell: >-
+    configmap=$(oc patch --filename={{ workdir }}/coffee-shop-yaml/coffee-shop/configmap.yaml --type=json --patch='[{"op": "remove", "path": {{ item }}}]' --local=true --dry-run=client -o yaml)
+    && echo "$configmap" > {{ workdir }}/coffee-shop-yaml/coffee-shop/configmap.yaml
+  loop:
+    - /metadata/namespace
+  register: this
+  failed_when: this.rc != 0 and 'missing value' not in this.stderr
+
+- name: create coffee-shop imagestream.yaml file
+  ansible.builtin.shell: |-
+    oc get is coffee-shop -o yaml -n {{ dev }} | oc neat > {{ workdir }}/coffee-shop-yaml/coffee-shop/imagestream.yaml
+
+- name: patch coffee-shop imagestream.yaml file
+  ansible.builtin.shell: >-
+    imagestream=$(oc patch --filename={{ workdir }}/coffee-shop-yaml/coffee-shop/imagestream.yaml --type=json --patch='[{"op": "remove", "path": {{ item }}}]' --local=true --dry-run=client -o yaml)
+    && echo "$imagestream" > {{ workdir }}/coffee-shop-yaml/coffee-shop/imagestream.yaml
+  loop:
+    - /metadata/annotations
+    - /metadata/namespace
+    - /spec/tags
+  register: this
+  failed_when: this.rc != 0 and 'missing value' not in this.stderr
+
+- name: create coffee-shop buildconfig.yaml file
+  ansible.builtin.shell: |-
+    oc get bc coffee-shop -o yaml -n {{ dev }} | oc neat > {{ workdir }}/coffee-shop-yaml/coffee-shop/buildconfig.yaml
+
+- name: patch coffee-shop buildconfig.yaml file
+  ansible.builtin.shell: >-
+    buildconfig=$(oc patch --filename={{ workdir }}/coffee-shop-yaml/coffee-shop/buildconfig.yaml --type=json --patch='[{"op": "remove", "path": {{ item }}}]' --local=true --dry-run=client -o yaml)
+    && echo "$buildconfig" > {{ workdir }}/coffee-shop-yaml/coffee-shop/buildconfig.yaml
+  loop:
+    - /metadata/annotations
+    - /metadata/namespace
+    - /spec/triggers
+  register: this
+  failed_when: this.rc != 0 and 'missing value' not in this.stderr
+
+- name: create barista knative_service.yaml file
+  ansible.builtin.shell: |-
+    oc get ksvc barista -o yaml -n {{ dev }} | oc neat > {{ workdir }}/coffee-shop-yaml/barista/knative_service.yaml
+
+- name: patch barista knative_service.yaml file
+  ansible.builtin.shell: >-
+    knative_service=$(oc patch --filename={{ workdir }}/coffee-shop-yaml/barista/knative_service.yaml --type=json --patch='[{"op": "remove", "path": {{ item }}}]' --local=true --dry-run=client -o yaml)
+    && echo "$knative_service" > {{ workdir }}/coffee-shop-yaml/barista/knative_service.yaml
+  loop:
+    - /metadata/annotations
+    - /metadata/namespace
+    - /spec/template/metadata/annotations
+    - /spec/template/metadata/creationTimestamp
+    - /spec/template/metadata/name
+  register: this
+  failed_when: this.rc != 0 and 'missing value' not in this.stderr
+
+- name: podman search barista image latest
+  ansible.builtin.shell: |-
+    podman search nexus-registry-nexus.{{ ocp_apps_domain }}/{{ ocp_user }}-barista --format "{{ '{{' }} .Name {{ '}}' }}" | tail -n 1 | cut -d "/" -f "2,3" | tr -d '"'
+  register: barista_latest_rs
+  until: barista_latest_rs.rc == 0 and barista_latest_rs.stdout | length > 0
+  retries: 6
+  delay: 10
+
+- name: patch barista image knative_service.yaml file
+  ansible.builtin.shell: >-
+    knative_service=$(oc patch --filename={{ workdir }}/coffee-shop-yaml/barista/knative_service.yaml --type=json --patch="[{\"op\": \"replace\", \"path\": \"/spec/template/spec/containers/0/image\",\"value\": {{ barista_latest_rs.stdout }}}]" --local=true --dry-run=client -o yaml)
+    && echo "$knative_service" > {{ workdir }}/coffee-shop-yaml/barista/knative_service.yaml
+
+- name: create barista imagestream.yaml file
+  ansible.builtin.shell: |-
+    oc get is barista -o yaml -n {{ dev }} | oc neat > {{ workdir }}/coffee-shop-yaml/barista/imagestream.yaml
+
+- name: patch barista imagestream.yaml file
+  ansible.builtin.shell: >-
+    imagestream=$(oc patch --filename={{ workdir }}/coffee-shop-yaml/barista/imagestream.yaml --type=json --patch='[{"op": "remove", "path": {{ item }}}]' --local=true --dry-run=client -o yaml)
+    && echo "$imagestream" > {{ workdir }}/coffee-shop-yaml/barista/imagestream.yaml
+  loop:
+    - /metadata/annotations
+    - /metadata/namespace
+    - /spec/tags
+  register: this
+  failed_when: this.rc != 0 and 'missing value' not in this.stderr
+
+- name: create barista buildconfig.yaml file
+  ansible.builtin.shell: |
+    oc get bc barista -o yaml -n {{ dev }} | oc neat > {{ workdir }}/coffee-shop-yaml/barista/buildconfig.yaml
+
+- name: patch barista buildconfig.yaml file
+  ansible.builtin.shell: >-
+    buildconfig=$(oc patch --filename={{ workdir }}/coffee-shop-yaml/barista/buildconfig.yaml --type=json --patch='[{"op": "remove", "path": {{ item }}}]' --local=true --dry-run=client -o yaml)
+    && echo "$buildconfig" > {{ workdir }}/coffee-shop-yaml/barista/buildconfig.yaml
+  loop:
+    - /metadata/annotations
+    - /metadata/namespace
+    - /spec/triggers
+  register: this
+  failed_when: this.rc != 0 and 'missing value' not in this.stderr
+
+- name: create database coffee-shop deployment.yaml file
+  ansible.builtin.shell: |-
+    oc get dc coffee-shop-database -o yaml -n {{ dev }} | oc neat > {{ workdir }}/coffee-shop-yaml/coffee-shop-database/deployment.yaml
+
+- name: patch (remove fields from) database coffee-shop deployment.yaml file
+  ansible.builtin.shell: >-
+    deployment=$(oc patch --filename={{ workdir }}/coffee-shop-yaml/coffee-shop-database/deployment.yaml --type=json --patch='[{"op": "remove", "path": {{ item }}}]' --local=true --dry-run=client -o yaml)
+    && echo "$deployment" > {{ workdir }}/coffee-shop-yaml/coffee-shop-database/deployment.yaml
+  loop:
+    - /metadata/annotations
+    - /metadata/labels/template
+    - /metadata/namespace
+    - /spec/template/metadata/annotations
+    - /spec/template/metadata/creationTimestamp
+    - /spec/triggers
+  register: this
+  failed_when: this.rc != 0 and 'missing value' not in this.stderr
+
+- name: patch (replace fields from) database coffee-shop deployment.yaml file
+  ansible.builtin.shell: >-
+    deployment=$(oc patch --filename={{ workdir }}/coffee-shop-yaml/coffee-shop-database/deployment.yaml --type=json --patch='[{"op": "replace", "path": {{ item.path }}, "value": {{ item.value }}}]' --local=true --dry-run=client -o yaml)
+    && echo "$deployment" > {{ workdir }}/coffee-shop-yaml/coffee-shop-database/deployment.yaml
+  loop:
+    - { path: '/apiVersion', value: 'apps/v1' }
+    - { path: '/kind', value: 'Deployment' }
+    - { path: '/spec/selector', value: '{ "matchLabels":{"name":"coffee-shop-database"}}' }
+    - { path: '/spec/template/spec/containers/0/image', value: 'image-registry.openshift-image-registry.svc:5000/openshift/postgresql:10-el8' }
+
+- name: create database coffee-shop service.yaml file
+  ansible.builtin.shell: |-
+    oc get service coffee-shop-database -o yaml -n {{ dev }} | oc neat > {{ workdir }}/coffee-shop-yaml/coffee-shop-database/service.yaml
+
+- name: patch database coffee-shop service.yaml file
+  ansible.builtin.shell: >-
+    service=$(oc patch --filename={{ workdir }}/coffee-shop-yaml/coffee-shop-database/service.yaml --type=json --patch='[{"op": "remove", "path": {{ item }}}]' --local=true --dry-run=client -o yaml)
+    && echo "$service" > {{ workdir }}/coffee-shop-yaml/coffee-shop-database/service.yaml
+  loop:
+    - /metadata/annotations
+    - /metadata/labels/template
+    - /metadata/namespace
+    - /spec/clusterIP
+    - /spec/clusterIPs
+    - /spec/internalTrafficPolicy
+    - /spec/ipFamilies
+    - /spec/ipFamilyPolicy
+  register: this
+  failed_when: this.rc != 0 and 'missing value' not in this.stderr
+
+- name: create database coffee-shop secret.yaml file
+  ansible.builtin.shell: |-
+    oc get secret coffee-shop-database -o yaml -n {{ dev }} | oc neat > {{ workdir }}/coffee-shop-yaml/coffee-shop-database/secret.yaml
+
+- name: patch database coffee-shop secret.yaml file
+  ansible.builtin.shell: >-
+    secret=$(oc patch --filename={{ workdir }}/coffee-shop-yaml/coffee-shop-database/secret.yaml --type=json --patch='[{"op": "remove", "path": {{ item }}}]' --local=true --dry-run=client -o yaml)
+    && echo "$secret" > {{ workdir }}/coffee-shop-yaml/coffee-shop-database/secret.yaml
+  loop:
+    - /metadata/annotations
+    - /metadata/labels/template
+    - /metadata/namespace
+  register: this
+  failed_when: this.rc != 0 and 'missing value' not in this.stderr
+
+- name: create database coffee-shop pvc.yaml file
+  ansible.builtin.shell: |-
+    oc get pvc coffee-shop-database -o yaml -n {{ dev }} | oc neat > {{ workdir }}/coffee-shop-yaml/coffee-shop-database/pvc.yaml
+
+- name: patch database coffee-shop pvc.yaml file
+  ansible.builtin.shell: >-
+    pvc=$(oc patch --filename={{ workdir }}/coffee-shop-yaml/coffee-shop-database/pvc.yaml --type=json --patch='[{"op": "remove", "path": {{ item }}}]' --local=true --dry-run=client -o yaml)
+    && echo "$pvc" > {{ workdir }}/coffee-shop-yaml/coffee-shop-database/pvc.yaml
+  loop:
+    - /metadata/annotations
+    - /metadata/labels/template
+    - /metadata/namespace
+    - /spec/volumeName
+    - /spec/storageClassName
+  register: this
+  failed_when: this.rc != 0 and 'missing value' not in this.stderr
+
+- import_tasks: ./05_gitops_utl_create_coffeeshop_test.yml
+
+- import_tasks: ./100_test_coffeeshop.yml
+
+- name: kubeseal encrypt secret coffee-shop-database
+  ansible.builtin.shell: >-
+    kubeseal --scope cluster-wide --controller-namespace sealed-secrets --controller-name sealed-secrets-controller --format yaml
+    < {{ workdir }}/coffee-shop-yaml/coffee-shop-database/secret.yaml
+    > {{ workdir }}/coffee-shop-yaml/coffee-shop-database/sealed_secret.yaml
+
+- name: kubeseal encrypt secret coffee-shop-database
+  ansible.builtin.shell: >-
+    kubeseal --scope cluster-wide --controller-namespace sealed-secrets --controller-name sealed-secrets-controller --format yaml
+    < {{ workdir }}/coffee-shop-yaml/coffee-shop/secret.yaml
+    > {{ workdir }}/coffee-shop-yaml/coffee-shop/sealed_secret.yaml
+
+- import_tasks: ./05_gitops_utl_create_coffeeshop_test.yml
+  vars:
+    secret_file: sealed_secret.yaml
+
+- import_tasks: ./100_test_coffeeshop.yml
+
+- name: delete original secret files
+  ansible.builtin.file:
+    path: "{{ workdir }}/{{ item }}"
+    state: absent
+  loop:
+    - coffee-shop-yaml/coffee-shop-database/secret.yaml
+    - coffee-shop-yaml/coffee-shop/secret.yaml
+
+- import_tasks: ./100_create_git_repo_push.yml
+  vars:
+    repo_name: coffee-shop-yaml
+
+- debug:
+    msg: "LAB 05 GITOPS - COMPLETED"

@@ -1,0 +1,181 @@
+---
+- debug:
+    msg: "LAB 03 SERVERLESS AND ADVANCED BUILDS"
+
+- name: delete application barista
+  ansible.builtin.shell: |-
+    oc delete deploy/barista buildconfig/barista service/barista imagestream/barista -n {{ dev }}
+  register: this
+  failed_when: this.rc != 0 and 'NotFound' not in this.stderr
+
+- name: delete secret gitea
+  ansible.builtin.shell: |-
+    oc delete secret gitea-secret -n {{ dev }}
+  register: this
+  failed_when: this.rc != 0 and 'NotFound' not in this.stderr
+
+- name: delete knative service barista
+  ansible.builtin.shell: |-
+    kn service delete barista -n {{ dev }}
+  register: this
+  failed_when: this.rc != 0 and 'not found' not in this.stderr
+
+- name: build maven app barista
+  ansible.builtin.shell: |-
+    mvn clean package -f {{ workdir }}/coffee-shop-source/barista -s {{ workdir }}/coffee-shop-source/nexus_settings.xml -DskipTests
+
+- name: create new-build binary barista
+  ansible.builtin.shell: |-
+    oc new-build --name barista --binary --image-stream openshift/ubi8-openjdk-11:1.3 --labels app.kubernetes.io/name=coffee-shop,app.openshift.io/runtime=quarkus --dry-run --output yaml | oc apply -n {{ dev }} --overwrite -f -
+
+- name: start build barista
+  ansible.builtin.shell: |-
+    oc start-build barista --from-file={{ workdir }}/coffee-shop-source/barista/target/barista-1.0-SNAPSHOT-runner.jar --wait
+
+- name: crete new-app barista
+  ansible.builtin.shell: |-
+    oc new-app {{ dev }}/barista:latest --labels app.kubernetes.io/part-of=coffee-shop,app.openshift.io/runtime=quarkus --dry-run --output yaml | oc apply -n {{ dev }} --overwrite -f -
+
+- name: set health check probes to barista
+  ansible.builtin.shell: |-
+    set -e
+    oc set probe deploy/barista --readiness --get-url=http://:8080/health -n {{ dev }}
+    oc set probe deploy/barista --liveness --get-url=http://:8080/health -n {{ dev }}
+
+- name: set resource requests to barista
+  ansible.builtin.shell: |-
+    oc set resources deploy/barista --requests=cpu=100m,memory=256Mi -n {{ dev }}
+
+- name: wait deployment barista
+  kubernetes.core.k8s_info:
+    kind: Deployment
+    name: barista
+    namespace: "{{ dev }}"
+    wait: yes
+    wait_timeout: 180
+
+- import_tasks: ./100_test_barista.yml
+
+- name: delete application coffee-shop
+  ansible.builtin.shell: |-
+    oc delete deploy/coffee-shop buildconfig/coffee-shop service/coffee-shop route/coffee-shop imagestream/coffee-shop -n {{ dev }}
+  register: this
+  failed_when: this.rc != 0 and 'NotFound' not in this.stderr
+
+- name: build maven app coffee-shop
+  ansible.builtin.shell: |-
+    mvn clean package -f {{ workdir }}/coffee-shop-source/coffee-shop -s {{ workdir }}/coffee-shop-source/nexus_settings.xml -DskipTests
+
+- name: create new-build binary coffee-shop
+  ansible.builtin.shell: |-
+    oc new-build --name coffee-shop --binary --image-stream openshift/ubi8-openjdk-11:1.3 --labels app.kubernetes.io/name=coffee-shop,app.openshift.io/runtime=quarkus --dry-run --output yaml | oc apply -n {{ dev }} --overwrite -f -
+
+- name: start build coffee-shop
+  ansible.builtin.shell: |-
+    oc start-build coffee-shop --from-file={{ workdir }}/coffee-shop-source/coffee-shop/target/coffee-shop-1.0-SNAPSHOT-runner.jar --wait
+
+- name: crete new-app coffee-shop
+  ansible.builtin.shell: |-
+    oc new-app {{ dev }}/coffee-shop:latest --labels app.kubernetes.io/part-of=coffee-shop,app.openshift.io/runtime=quarkus --dry-run --output yaml | oc apply -n {{ dev }} --overwrite -f -
+
+- name: set health check probes to coffee-shop
+  ansible.builtin.shell: |-
+    set -e
+    oc set probe deploy/coffee-shop --readiness --get-url=http://:8080/health -n {{ dev }}
+    oc set probe deploy/coffee-shop --liveness --get-url=http://:8080/health -n {{ dev }}
+
+- name: set resource requests to coffee-shop
+  ansible.builtin.shell: |-
+    oc set resources deploy/coffee-shop --requests=cpu=100m,memory=384Mi -n {{ dev }}
+
+- name: set deployment env coffee-shop from configmap and secret
+  ansible.builtin.shell: |-
+    set -e
+    oc set env deploy coffee-shop --from=secret/coffee-shop --overwrite -n {{ dev }}
+    oc set env deploy coffee-shop --from=configmap/coffee-shop --overwrite -n {{ dev }}
+
+- name: annotate deployment coffee-shop
+  ansible.builtin.shell: |-
+    oc annotate deploy coffee-shop app.openshift.io/connects-to='["coffee-shop-database",{"apiVersion":"apps.openshift.io/v1","kind":"DeploymentConfig","name":"coffee-shop-database"},{"apiVersion":"apps/v1","kind":"Deployment","name":"barista"}]' --overwrite -n {{ dev }}
+
+- name: wait deployment coffee-shop
+  kubernetes.core.k8s_info:
+    kind: Deployment
+    name: coffee-shop
+    namespace: "{{ dev }}"
+    wait: yes
+    wait_timeout: 180
+
+- name: expose route coffee-shop
+  ansible.builtin.shell: |-
+    oc expose service coffee-shop --dry-run --output yaml -n {{ dev }} | oc apply --overwrite -n {{ dev }} -f -
+
+- name: get route coffee-shop
+  kubernetes.core.k8s_info:
+    api_version: route.openshift.io/v1
+    kind: Route
+    name: coffee-shop
+    namespace: "{{ dev }}"
+  register: coffeeshop_route
+
+- name: test route coffee-shop health check
+  ansible.builtin.uri:
+    url: http://{{ coffeeshop_route.resources[0].spec.host }}/health
+    return_content: yes
+  register: this
+  until: this.status == 200 and 'UP' in this.content
+  retries: 3
+  delay: 5
+
+- name: prompt barista serverless
+  ansible.builtin.pause:
+    prompt: "Continue to update the barista app to serverless..."
+  when: prompt | default(false) | bool
+
+- name: delete deployment and service barista
+  ansible.builtin.shell: |-
+    oc delete deploy/barista service/barista -n {{ dev }}
+  register: this
+  failed_when: this.rc != 0 and 'NotFound' not in this.stderr
+
+- name: create knative service barista
+  ansible.builtin.shell: >-
+    kn service create barista
+    --image image-registry.openshift-image-registry.svc:5000/{{ dev }}/barista:latest
+    --label app.openshift.io/runtime=quarkus
+    --label app.kubernetes.io/part-of=coffee-shop
+    --port 8080
+    --cluster-local
+    --request cpu=100m,memory=256Mi
+    --force
+    --namespace {{ dev }}
+
+- name: get knative service route barista
+  kubernetes.core.k8s_info:
+    api_version: serving.knative.dev/v1
+    kind: Route
+    name: barista
+    namespace: "{{ dev }}"
+  register: barista_route
+
+- name: update coffee-shop configmap
+  ansible.builtin.shell: |-
+    oc create configmap coffee-shop --from-literal=BARISTA_URL={{ barista_route.resources[0].status.url }}/processes --dry-run --output yaml | oc apply -n {{ dev }} --overwrite -f -
+
+- name: delete pod coffee-shop
+  ansible.builtin.shell: |-
+    oc delete pod -l deployment=coffee-shop -n {{ dev }}
+  register: this
+  failed_when: this.rc != 0 and 'NotFound' not in this.stderr
+
+- name: annotate deployment coffee-shop
+  ansible.builtin.shell: |-
+    oc annotate deploy coffee-shop app.openshift.io/connects-to='["coffee-shop-database",{"apiVersion":"apps/v1","kind":"Deployment","name":"coffee-shop-database"},{"apiVersion":"serving.knative.dev/v1","kind":"Service","name":"barista"},{"apiVersion":"apps.openshift.io/v1","kind":"DeploymentConfig","name":"coffee-shop-database"}]' --overwrite -n {{ dev }}
+
+- debug:
+    msg:
+      - Explore the coffee-shop application in your browser.
+      - http://{{ coffeeshop_route.resources[0].spec.host }}/index.html
+
+- debug:
+    msg: "LAB 03 SERVERLESS AND ADVANCED BUILDS - COMPLETED"
