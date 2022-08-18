@@ -1,7 +1,7 @@
 ---
 - name: expose route barista
   ansible.builtin.shell: |-
-    oc expose service barista --dry-run --output yaml -n {{ dev }} | oc apply --overwrite -n {{ dev }} -f -
+    oc expose service barista --dry-run=client --output yaml | oc apply --overwrite -n {{ dev }} -f -
 
 - name: get route barista
   kubernetes.core.k8s_info:

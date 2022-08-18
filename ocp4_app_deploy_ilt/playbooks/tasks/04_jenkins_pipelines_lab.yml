@@ -99,8 +99,8 @@
 - name: expose service and route coffe-shop in {{ prod }}
   ansible.builtin.shell: |-
     set -e
-    oc expose deploy coffee-shop --port 8080 --dry-run --output yaml -n {{ prod }} | oc apply -n {{ prod }} --overwrite -f -
-    oc expose service coffee-shop --dry-run --output yaml -n {{ prod }} | oc apply -n {{ prod }} --overwrite -f -
+    oc expose deploy coffee-shop --port 8080 --dry-run=client --output yaml | oc apply -n {{ prod }} --overwrite -f -
+    oc expose service coffee-shop --dry-run=client --output yaml | oc apply -n {{ prod }} --overwrite -f -
 
 - name: create knative service barista placeholder
   ansible.builtin.shell: >-

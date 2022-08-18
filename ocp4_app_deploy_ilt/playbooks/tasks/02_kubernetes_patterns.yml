@@ -100,7 +100,7 @@
 
 - name: expose route coffee-shop
   ansible.builtin.shell: |-
-    oc expose service coffee-shop --dry-run --output yaml -n {{ dev }} | oc apply --overwrite -n {{ dev }} -f -
+    oc expose service coffee-shop --dry-run=client --output yaml | oc apply --overwrite -n {{ dev }} -f -
 
 - name: get route coffee-shop
   kubernetes.core.k8s_info:
