@@ -51,7 +51,7 @@
     name: barista
     namespace: "{{ dev }}"
     wait: yes
-    wait_timeout: 180
+    wait_timeout: 360
 
 - import_tasks: ./100_test_barista.yml
 
@@ -96,7 +96,7 @@
     name: coffee-shop
     namespace: "{{ dev }}"
     wait: yes
-    wait_timeout: 180
+    wait_timeout: 360
 
 - name: expose route coffee-shop
   ansible.builtin.shell: |-
